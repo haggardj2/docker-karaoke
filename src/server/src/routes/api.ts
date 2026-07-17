@@ -73,6 +73,7 @@ import {
   BreakMusicScanAlreadyInProgressError,
   runBreakMusicScan,
 } from '../breakMusicScanner.js';
+import { buildOidcGrantCallbackUrl } from '../oidcRedirect.js';
 import {
   DownloadScanAlreadyInProgressError,
   scanDownloadLocation,
@@ -1228,7 +1229,7 @@ apiRouter.put(
 // ===================== OIDC AUTH FLOW =====================
 
 // In-memory store for OIDC state/PKCE (expires after 10 minutes)
-const oidcStateStore = new Map<string, { codeVerifier: string; createdAt: number; returnTo: '/admin' | '/host' }>();
+const oidcStateStore = new Map<string, { codeVerifier: string; createdAt: number; returnTo: '/admin' | '/host'; redirectUri: string }>();
 const oidcExchangeStore = new Map<string, {
   sessionToken: string;
   role: string;
@@ -1284,7 +1285,7 @@ apiRouter.get(
       const codeChallenge = await oidc.calculatePKCECodeChallenge(codeVerifier);
       const returnTo = normalizeOidcReturnTo(req.query.returnTo);
 
-      oidcStateStore.set(state, { codeVerifier, createdAt: Date.now(), returnTo });
+      oidcStateStore.set(state, { codeVerifier, createdAt: Date.now(), returnTo, redirectUri });
 
       const authUrl = oidc.buildAuthorizationUrl(config, {
         redirect_uri: redirectUri,
@@ -1314,36 +1315,33 @@ apiRouter.get(
     const issuerUrl = await getSetting('oidc.issuer');
     const clientId = await getSetting('oidc.client_id');
     const clientSecret = await getSetting('oidc.client_secret');
-    const redirectUri = await getSetting('oidc.redirect_uri');
 
-    if (!issuerUrl || !clientId || !clientSecret || !redirectUri) {
+    if (!issuerUrl || !clientId || !clientSecret) {
       return res.status(400).send('OIDC is not fully configured');
     }
 
     try {
-      const config = await oidc.discovery(
-        new URL(issuerUrl),
-        clientId,
-        {
-          client_secret: clientSecret,
-          redirect_uris: [redirectUri],
-          response_types: ['code'],
-        },
-        oidc.ClientSecretPost(clientSecret),
-      );
-
-      const host = req.headers.host || 'localhost:5174';
-      const protoHeader = req.headers['x-forwarded-proto'];
-      const proto = Array.isArray(protoHeader) ? protoHeader[0] : (protoHeader || 'http');
-      const currentUrl = new URL(req.originalUrl, `${proto}://${host}`);
-
-      const stateKey = currentUrl.searchParams.get('state') || '';
+      const incomingUrl = new URL(req.originalUrl, 'http://localhost');
+      const stateKey = incomingUrl.searchParams.get('state') || '';
 
       const stored = stateKey ? oidcStateStore.get(stateKey) : undefined;
       if (!stored) {
         return res.status(400).send('Invalid or expired OIDC state');
       }
       oidcStateStore.delete(stateKey);
+
+      const config = await oidc.discovery(
+        new URL(issuerUrl),
+        clientId,
+        {
+          client_secret: clientSecret,
+          redirect_uris: [stored.redirectUri],
+          response_types: ['code'],
+        },
+        oidc.ClientSecretPost(clientSecret),
+      );
+
+      const currentUrl = buildOidcGrantCallbackUrl(stored.redirectUri, req.originalUrl);
 
       const tokenSet = await oidc.authorizationCodeGrant(
         config,
@@ -1353,7 +1351,7 @@ apiRouter.get(
           pkceCodeVerifier: stored.codeVerifier,
         },
         {
-          redirect_uri: redirectUri,
+          redirect_uri: stored.redirectUri,
         },
       );
 
