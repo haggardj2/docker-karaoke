@@ -13,7 +13,7 @@
   <ReadMe
     >https://github.com/haggardj2/KaraokeDock/tree/main/docs/unraid_readme.md</ReadMe>
   <Overview
-    >A modern, full-featured web-based karaoke system with support for multiple media formats, real-time queue management, and external karaoke integration. Requires a PostgreSQL database. See the Unraid README: https://github.com/haggardj2/KaraokeDock/blob/main/docs/unraid_readme.md</Overview>
+    >A modern, full-featured web-based karaoke system with support for multiple media formats, real-time queue management, and external karaoke integration. Requires a PostgreSQL database. See the Unraid README: https://github.com/haggardj2/KaraokeDock/blob/a1f5468ee4af65fcfc9b9a3189d09f86cf421eb5/docs/unraid_readme.md</Overview>
   <Category>MediaApp:Music MediaServer:Other</Category>
   <License>GPLv2</License>
   <WebUI>http://[IP]:[PORT:5173]</WebUI>
