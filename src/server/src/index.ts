@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import type { Duplex } from 'node:stream';
-import { apiRouter, setPostQueueUpdate } from './routes/api';
+import { apiRouter, setPostQueueUpdate, syncRemoteGatewayTaskState } from './routes/api';
 import { mediaRouter } from './routes/media';
 import { WebSocketServer } from 'ws';
 import { qrRouter } from './routes/qr';
@@ -22,6 +22,7 @@ function timestamp() {
 
 const app = express();
 const port = Number(process.env.PORT || 5174);
+const bindHost = process.env.BIND_HOST?.trim();
 const BOOTSTRAP_PASSWORD_LOG_DELAY_MS = 5_000;
 const webDistDir = process.env.WEB_DIST_DIR?.trim();
 const bootstrapAdminPromise = ensureAdminUser().catch((e) => {
@@ -29,10 +30,29 @@ const bootstrapAdminPromise = ensureAdminUser().catch((e) => {
   return null;
 });
 
-const injectedRuntimeConfigScript = process.env.WEB_RUNTIME_API_BASE?.trim()
-  ? `<script>window.__ENV__={API_BASE:${JSON.stringify(process.env.WEB_RUNTIME_API_BASE.trim())}}</script>`
-  : '<script>window.__ENV__={API_BASE:window.location.origin}</script>';
+const runtimeApiBase = process.env.WEB_RUNTIME_API_BASE;
+const injectedRuntimeConfigScript = runtimeApiBase === undefined
+  ? '<script>window.__ENV__={API_BASE:window.location.origin}</script>'
+  : `<script>window.__ENV__={API_BASE:${JSON.stringify(runtimeApiBase.trim())}}</script>`;
 let cachedSpaHtmlPromise: Promise<string> | null = null;
+
+async function writeBootstrapCredentialsFile(bootstrapAdmin: { username: string; password: string }) {
+  const credentialsFile = process.env.BOOTSTRAP_CREDENTIALS_FILE?.trim();
+  if (!credentialsFile) return;
+
+  await fs.mkdir(path.dirname(credentialsFile), { recursive: true });
+  await fs.writeFile(
+    credentialsFile,
+    `${JSON.stringify({
+      username: bootstrapAdmin.username,
+      password: bootstrapAdmin.password,
+      generatedAt: new Date().toISOString(),
+      message: 'Change this password immediately after first login.',
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  await fs.chmod(credentialsFile, 0o600);
+}
 
 function shouldServeSpaFallback(requestPath: string) {
   if (
@@ -207,20 +227,27 @@ setPostQueueUpdate((type = 'queue.updated', data?: any) => {
   });
 });
 
-const server = app.listen(port, () => {
-  console.log(`API running on http://localhost:${port}`);
+function onServerListening() {
+  console.log(`API running on http://${bindHost || 'localhost'}:${port}`);
   if (webDistDir) {
     console.log(`Serving web app from ${webDistDir}`);
   }
   void bootstrapAdminPromise.then((bootstrapAdmin) => {
     if (!bootstrapAdmin) return;
+    void writeBootstrapCredentialsFile(bootstrapAdmin).catch((error) => {
+      console.error('[security] Failed to write bootstrap credentials file:', error);
+    });
     setTimeout(() => {
       console.log(
         `[security] No admin password was configured. Generated bootstrap credentials: username="${bootstrapAdmin.username}" password="${bootstrapAdmin.password}". Change this password immediately after first login.`
       );
     }, BOOTSTRAP_PASSWORD_LOG_DELAY_MS);
   });
-});
+}
+
+const server = bindHost
+  ? app.listen(port, bindHost, onServerListening)
+  : app.listen(port, onServerListening);
 
 server.on('upgrade', (req, socket, head) => {
   const origin = Array.isArray(req.headers.origin) ? req.headers.origin[0] : req.headers.origin;
@@ -269,6 +296,7 @@ setTimeout(async () => {
     }
 
     await syncBackgroundTaskState({ runDurationImmediately: true });
+    await syncRemoteGatewayTaskState({ runImmediately: true });
   } catch (err) {
     console.error('Failed to start background task:', err);
   }

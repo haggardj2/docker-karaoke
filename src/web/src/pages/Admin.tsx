@@ -136,6 +136,7 @@ type AdminCardState = {
   mediaLibrariesExpanded: boolean;
   breakMusicExpanded: boolean;
   systemSettingsExpanded: boolean;
+  remoteGatewayExpanded: boolean;
   usersExpanded: boolean;
   oidcSettingsExpanded: boolean;
 };
@@ -145,6 +146,7 @@ function loadAdminCardState(): AdminCardState {
     mediaLibrariesExpanded: true,
     breakMusicExpanded: true,
     systemSettingsExpanded: true,
+    remoteGatewayExpanded: true,
     usersExpanded: true,
     oidcSettingsExpanded: false,
   };
@@ -164,6 +166,7 @@ function loadAdminCardState(): AdminCardState {
       mediaLibrariesExpanded: parsed.mediaLibrariesExpanded ?? defaults.mediaLibrariesExpanded,
       breakMusicExpanded: parsed.breakMusicExpanded ?? defaults.breakMusicExpanded,
       systemSettingsExpanded: parsed.systemSettingsExpanded ?? defaults.systemSettingsExpanded,
+      remoteGatewayExpanded: parsed.remoteGatewayExpanded ?? defaults.remoteGatewayExpanded,
       usersExpanded: parsed.usersExpanded ?? defaults.usersExpanded,
       oidcSettingsExpanded: parsed.oidcSettingsExpanded ?? defaults.oidcSettingsExpanded,
     };
@@ -235,10 +238,17 @@ export default function Admin() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [allowDownloads, setAllowDownloads] = useState(true);
   const [showDownloadBrowser, setShowDownloadBrowser] = useState(false);
+  const [stationMode, setStationMode] = useState(false);
+  const [remoteGatewayEnabled, setRemoteGatewayEnabled] = useState(false);
+  const [remoteGatewayUrl, setRemoteGatewayUrl] = useState("");
+  const [remoteGatewayToken, setRemoteGatewayToken] = useState("");
+  const [remoteGatewayPollInterval, setRemoteGatewayPollInterval] = useState(5);
+  const [remoteGatewayBusy, setRemoteGatewayBusy] = useState(false);
+  const [remoteGatewayStatus, setRemoteGatewayStatus] = useState<any>(null);
   
   // Collapsible card states
   const [cardState, setCardState] = useState<AdminCardState>(() => loadAdminCardState());
-  const { mediaLibrariesExpanded, breakMusicExpanded, systemSettingsExpanded, usersExpanded, oidcSettingsExpanded } = cardState;
+  const { mediaLibrariesExpanded, breakMusicExpanded, systemSettingsExpanded, remoteGatewayExpanded, usersExpanded, oidcSettingsExpanded } = cardState;
 
   // User Manager state
   const [users, setUsers] = useState<ManagedUser[]>([]);
@@ -571,7 +581,7 @@ export default function Admin() {
 
   async function deleteLibrary(id: number) {
     if (!auth.sessionToken || ! auth.isLoggedIn) return alert("Please login first");
-    if (!confirm("Remove this library?  (Tracks remain until Clear DB)")) return;
+    if (!confirm("Remove this library? Tracks remain in the database until Clear DB, but will no longer be attached to this library.")) return;
     setBusy(true);
     try {
       await api(`/api/libraries/${id}`, {
@@ -795,6 +805,11 @@ export default function Admin() {
       setLocalBrowseEnabled(parseBooleanSetting(settings["requests.local_browse_enabled"]));
       setAllowDownloads(parseBooleanSetting(settings["ytdlp.allow_downloads"]));
       setBreakPlaylistsFolder(settings["break_music.playlists_folder"] || "/media/playlists");
+      setStationMode(settings["station.mode"] === true);
+      setRemoteGatewayEnabled(settings["remote_gateway.enabled"] === true);
+      setRemoteGatewayUrl(settings["remote_gateway.url"] || "");
+      setRemoteGatewayToken(settings["remote_gateway.api_token"] || "");
+      setRemoteGatewayPollInterval(Number(settings["remote_gateway.poll_interval_seconds"] ?? 5));
       if (settings["admin.log_level"]) setLogLevel(settings["admin.log_level"]);
     } catch (err) {
       console.error("Failed to load settings:", err);
@@ -834,6 +849,85 @@ export default function Admin() {
     } catch (err: any) {
       setBanner(`⚠️ Failed to update break music playlists folder: ${err.message}`);
       setTimeout(() => setBanner(""), 5000);
+    }
+  }
+
+  function generateRemoteGatewayToken() {
+    const bytes = new Uint8Array(32);
+    window.crypto.getRandomValues(bytes);
+    const token = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    setRemoteGatewayToken(token);
+  }
+
+  async function persistRemoteGatewaySettings() {
+    await Promise.all([
+      saveSetting("remote_gateway.enabled", remoteGatewayEnabled),
+      saveSetting("remote_gateway.url", remoteGatewayUrl.trim()),
+      saveSetting("remote_gateway.api_token", remoteGatewayToken.trim()),
+      saveSetting("remote_gateway.poll_interval_seconds", Math.max(2, Number(remoteGatewayPollInterval) || 5)),
+    ]);
+  }
+
+  async function saveRemoteGatewaySettings() {
+    try {
+      await persistRemoteGatewaySettings();
+      setBanner("✔ Remote Requests Gateway settings saved");
+      setTimeout(() => setBanner(""), 3000);
+    } catch (err: any) {
+      setBanner(`⚠️ Failed to save Remote Requests Gateway settings: ${err.message}`);
+      setTimeout(() => setBanner(""), 5000);
+    }
+  }
+
+  async function copyRemoteGatewayToken() {
+    if (!remoteGatewayToken) return;
+    try {
+      await navigator.clipboard.writeText(remoteGatewayToken);
+      setBanner("✔ Remote Requests Gateway token copied");
+      setTimeout(() => setBanner(""), 3000);
+    } catch (err: any) {
+      setBanner(`⚠️ Failed to copy Remote Requests Gateway token: ${err.message}`);
+      setTimeout(() => setBanner(""), 5000);
+    }
+  }
+
+  async function testRemoteGatewayConnection() {
+    setRemoteGatewayBusy(true);
+    try {
+      await persistRemoteGatewaySettings();
+      const result = await api("/api/admin/remote-gateway/test", {
+        method: "POST",
+        headers: sessionHeaders,
+      });
+      setRemoteGatewayStatus(result);
+      setBanner(`✔ Gateway connected (${result.status?.tracks ?? 0} tracks, ${result.status?.pendingRequests ?? 0} pending requests)`);
+      setTimeout(() => setBanner(""), 3000);
+    } catch (err: any) {
+      setRemoteGatewayStatus({ ok: false, error: err.message });
+      setBanner(`⚠️ Gateway connection failed: ${err.message}`);
+      setTimeout(() => setBanner(""), 5000);
+    } finally {
+      setRemoteGatewayBusy(false);
+    }
+  }
+
+  async function syncRemoteGatewayNow() {
+    setRemoteGatewayBusy(true);
+    try {
+      await persistRemoteGatewaySettings();
+      const result = await api("/api/admin/remote-gateway/sync", {
+        method: "POST",
+        headers: sessionHeaders,
+      });
+      setRemoteGatewayStatus(result);
+      setBanner(`✔ Gateway synced ${result.catalog?.accepted ?? 0} tracks, queued ${result.pulledRequests?.queued ?? 0} requests, applied ${result.queueActions?.applied ?? 0} queue actions`);
+      setTimeout(() => setBanner(""), 3000);
+    } catch (err: any) {
+      setRemoteGatewayStatus({ ok: false, error: err.message });
+      setBanner(`⚠️ Gateway sync failed: ${err.message}`);
+      setTimeout(() => setBanner(""), 5000);
+    } finally {
+      setRemoteGatewayBusy(false);
     }
   }
 
@@ -2189,16 +2283,21 @@ export default function Admin() {
                     <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
                       <input
                         type="checkbox"
-                        checked={!localLibraryEnabled && !externalLibraryEnabled}
+                        checked={requestAcceptance === "disabled" || (!localLibraryEnabled && !externalLibraryEnabled)}
                         onChange={(e) => {
                           const disabled = e.target.checked;
-                          if (disabled) {
-                            handleLibraryToggle("local", false);
-                            handleLibraryToggle("external", false);
-                          } else {
-                            // When unchecking disabled, enable local library by default
-                            handleLibraryToggle("local", true);
-                          }
+                          void (async () => {
+                            await handleRequestAcceptanceChange(disabled ? "disabled" : "local");
+                            if (!disabled) {
+                              // When unchecking disabled, enable local library by default
+                              await handleLibraryToggle("local", true);
+                              return;
+                            }
+                            await Promise.all([
+                              handleLibraryToggle("local", false),
+                              handleLibraryToggle("external", false),
+                            ]);
+                          })();
                         }}
                         disabled={!auth.sessionToken || !auth.isLoggedIn}
                         style={{ width: 18, height: 18 }}
@@ -2432,6 +2531,148 @@ export default function Admin() {
               </div>
             </div>
 
+            {/* Remote Requests Gateway Card */}
+            {stationMode && (
+              <div className="card">
+                <div className="card-header" onClick={() => updateCardState('remoteGatewayExpanded', !remoteGatewayExpanded)}>
+                  <h2><MaterialIcon name="cloud_sync" style={{ fontSize: 24, verticalAlign: 'text-bottom', marginRight: 8 }} />Remote Requests Gateway</h2>
+                  <button className="card-toggle" type="button">
+                    {remoteGatewayExpanded ? <><MaterialIcon name="expand_less" style={{ fontSize: 18, verticalAlign: 'text-bottom', marginRight: 4 }} />Collapse</> : <><MaterialIcon name="play_arrow" style={{ fontSize: 18, verticalAlign: 'text-bottom', marginRight: 4 }} />Expand</>}
+                  </button>
+                </div>
+                <div className={`card-content ${remoteGatewayExpanded ? 'expanded' : 'collapsed'}`}>
+                  <p style={{ margin: "0 0 16px", color: "var(--color-text-muted)", fontSize: 14 }}>
+                    Configure the public Remote Requests Gateway that will mirror the Station catalog and forward singer requests back to this local Station.
+                  </p>
+                  <div className="form-group">
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={remoteGatewayEnabled}
+                        onChange={(e) => setRemoteGatewayEnabled(e.target.checked)}
+                        disabled={!auth.sessionToken || !auth.isLoggedIn}
+                        style={{ width: 18, height: 18 }}
+                      />
+                      <span className="form-label" style={{ margin: 0 }}>Enable Remote Requests Gateway</span>
+                    </label>
+                    <p style={{ margin: "6px 0 0 26px", color: "var(--color-text-muted)", fontSize: 13 }}>
+                      When enabled, Station request links and the QR code point to the Gateway URL instead of the local Requests page.
+                    </p>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Gateway URL</label>
+                    <input
+                      className="form-input"
+                      type="url"
+                      placeholder="https://requests.example.com"
+                      value={remoteGatewayUrl}
+                      onChange={(e) => setRemoteGatewayUrl(e.target.value)}
+                      disabled={!auth.sessionToken || !auth.isLoggedIn}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Auto-sync Poll Interval (seconds)</label>
+                    <input
+                      className="form-input"
+                      type="number"
+                      min={2}
+                      step={1}
+                      value={remoteGatewayPollInterval}
+                      onChange={(e) => setRemoteGatewayPollInterval(Number(e.target.value))}
+                      disabled={!auth.sessionToken || !auth.isLoggedIn}
+                    />
+                    <p style={{ margin: "6px 0 0", color: "var(--color-text-muted)", fontSize: 13 }}>
+                      Station polls the Gateway for new requests and refreshes My Queue automatically at this interval.
+                    </p>
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Station API Token</label>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <input
+                        className="form-input"
+                        type="text"
+                        placeholder="Generate a token for Station/Gateway API auth"
+                        value={remoteGatewayToken}
+                        onChange={(e) => setRemoteGatewayToken(e.target.value)}
+                        disabled={!auth.sessionToken || !auth.isLoggedIn}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button
+                        className="btn"
+                        type="button"
+                        onClick={generateRemoteGatewayToken}
+                        disabled={!auth.sessionToken || !auth.isLoggedIn}
+                      >
+                        Generate
+                      </button>
+                      <button
+                        className="btn"
+                        type="button"
+                        onClick={copyRemoteGatewayToken}
+                        disabled={!auth.sessionToken || !auth.isLoggedIn || !remoteGatewayToken}
+                      >
+                        Copy
+                      </button>
+                    </div>
+                    <p style={{ margin: "6px 0 0", color: "var(--color-text-muted)", fontSize: 13 }}>
+                      Use this shared token on the Gateway to authenticate catalog sync and request bridge API calls.
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    <button
+                      className="btn primary"
+                      type="button"
+                      onClick={saveRemoteGatewaySettings}
+                      disabled={!auth.sessionToken || !auth.isLoggedIn || remoteGatewayBusy}
+                    >
+                      Save Gateway Settings
+                    </button>
+                    <button
+                      className="btn"
+                      type="button"
+                      onClick={testRemoteGatewayConnection}
+                      disabled={!auth.sessionToken || !auth.isLoggedIn || remoteGatewayBusy}
+                    >
+                      {remoteGatewayBusy ? "Working..." : "Test Connection"}
+                    </button>
+                    <button
+                      className="btn success"
+                      type="button"
+                      onClick={syncRemoteGatewayNow}
+                      disabled={!auth.sessionToken || !auth.isLoggedIn || remoteGatewayBusy}
+                    >
+                      Sync Now
+                    </button>
+                  </div>
+                  {remoteGatewayStatus && (
+                    <div style={{
+                      marginTop: 16,
+                      padding: 12,
+                      border: "1px solid var(--color-border)",
+                      borderRadius: 12,
+                      background: "var(--color-bg-secondary)",
+                      color: remoteGatewayStatus.ok === false ? "#fca5a5" : "var(--color-text-secondary)",
+                      fontSize: 13,
+                    }}>
+                      {remoteGatewayStatus.ok === false ? (
+                        <div><strong>Gateway error:</strong> {remoteGatewayStatus.error}</div>
+                      ) : (
+                        <div style={{ display: "grid", gap: 4 }}>
+                          <div><strong>Gateway connected:</strong> {remoteGatewayStatus.gatewayUrl}</div>
+                          <div><strong>Gateway catalog:</strong> {remoteGatewayStatus.status?.tracks ?? 0} tracks</div>
+                          <div><strong>Pending requests:</strong> {remoteGatewayStatus.status?.pendingRequests ?? 0}</div>
+                          {remoteGatewayStatus.catalog && (
+                            <div><strong>Last sync:</strong> {remoteGatewayStatus.catalog.accepted ?? 0} tracks accepted, {remoteGatewayStatus.pulledRequests?.queued ?? 0} requests queued, {remoteGatewayStatus.queueActions?.applied ?? 0} queue actions applied, {remoteGatewayStatus.queue?.accepted ?? 0} queue items pushed</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* User Manager Card */}
             <div className="card">
               <div className="card-header" onClick={() => updateCardState('usersExpanded', !usersExpanded)}>
@@ -2538,6 +2779,7 @@ export default function Admin() {
             </div>
 
             {/* OIDC Settings Card */}
+            {!stationMode && (
             <div className="card">
               <div className="card-header" onClick={() => updateCardState('oidcSettingsExpanded', !oidcSettingsExpanded)}>
                 <h2><MaterialIcon name="link" style={{ fontSize: 24, verticalAlign: 'text-bottom', marginRight: 8 }} />SSO / OIDC Settings</h2>
@@ -2656,6 +2898,7 @@ export default function Admin() {
                 </form>
               </div>
             </div>
+            )}
 
             {showAddLibraryModal && (
               <>

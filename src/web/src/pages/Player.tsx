@@ -111,11 +111,30 @@ function getYouTubeVideoId(url: string): string | null {
         return normalizeVideoId(segments[1]);
       }
     }
+
   } catch {
     return null;
   }
 
   return null;
+}
+
+function describeYouTubeIframeError(code: unknown): string {
+  switch (Number(code)) {
+    case 2:
+      return "The YouTube video id or request parameters are invalid.";
+    case 5:
+      return "The video cannot be played by the HTML5 YouTube player.";
+    case 100:
+      return "The YouTube video was not found or is private.";
+    case 101:
+    case 150:
+      return "The video owner does not allow embedded playback.";
+    case 153:
+      return "YouTube rejected the embedded player configuration, usually because the request did not include an acceptable HTTP Referer.";
+    default:
+      return "The YouTube iframe player reported an unknown playback error.";
+  }
 }
 
 // Helper function to validate duration values
@@ -272,7 +291,6 @@ export default function Player() {
     ) as HTMLElement[];
     els.forEach((e) => (e.style.display = "none"));
 
-    // Load YouTube IFrame API
     if (!(window as any).YT) {
       const tag = document.createElement("script");
       tag.src = "https://www.youtube.com/iframe_api";
@@ -564,12 +582,10 @@ export default function Player() {
     };
   }, [refresh, refreshBreakMusicState]);
 
-  // Determine YouTube state based on current song (moved out of useMemo to avoid side effects)
   useEffect(() => {
     if (!now) {
       setIsYouTube(false);
       setYoutubeVideoId(null);
-      // Clean up YouTube player when song ends
       if (youtubePlayerRef.current) {
         try {
           youtubePlayerRef.current.stopVideo();
@@ -585,20 +601,9 @@ export default function Player() {
       return;
     }
 
-    // Handle external URLs (e.g., from Karaoke Nerds)
-    if (now.external_url) {
-      const videoId = getYouTubeVideoId(now.external_url);
-      if (videoId) {
-        setIsYouTube(true);
-        setYoutubeVideoId(videoId);
-      } else {
-        setIsYouTube(false);
-        setYoutubeVideoId(null);
-      }
-    } else {
-      setIsYouTube(false);
-      setYoutubeVideoId(null);
-    }
+    const videoId = now.external_url ? getYouTubeVideoId(now.external_url) : null;
+    setIsYouTube(Boolean(videoId));
+    setYoutubeVideoId(videoId);
   }, [now?.id, now?.external_url]);
 
   // Build the media URL - pure computation, no side effects
@@ -608,7 +613,6 @@ export default function Player() {
 
     // Handle external URLs (e.g., from Karaoke Nerds)
     if (now.external_url) {
-      // Check if it's a YouTube URL - return empty string as we'll use iframe instead
       const videoId = getYouTubeVideoId(now.external_url);
       if (videoId) {
         return "";
@@ -673,9 +677,7 @@ export default function Player() {
     setNeedsUserInteraction(false);
     setIsPlaying(false);
 
-    // Handle YouTube videos
     if (isYouTube && youtubeVideoId) {
-      // YouTube iframe will autoplay via URL parameter
       setIsPlaying(true);
       return;
     }
@@ -861,11 +863,10 @@ export default function Player() {
     };
   }, [now, sendTimingUpdate]);
 
-  // Report timing updates to server for Host page (regular videos only)
+  // Report timing updates to server for Host page
   useEffect(() => {
     if (!now) return;
 
-    // YouTube timing is handled separately via YouTube IFrame API
     if (isYouTube) return;
 
     const v = videoRef.current;
@@ -916,121 +917,105 @@ export default function Player() {
     return () => clearInterval(intervalId);
   }, [now, isYouTube, sendTimingUpdate]);
 
-  // Report YouTube timing updates using IFrame API
+  // Report YouTube timing updates using the IFrame API. YouTube is attempted
+  // through the iframe first; fallback download only starts after an iframe API
+  // error such as embedding disabled (101/150).
   useEffect(() => {
     if (!now || !isYouTube || !youtubeVideoId) return;
 
-    // Create a unique player container ID
     const playerId = "youtube-player-" + youtubeVideoId;
-    const IFRAME_READY_TIMEOUT = 100;
-    const INIT_DELAY = 500;
-
-    // Initialize YouTube player when API is ready
     const initPlayer = () => {
       const YT = (window as any).YT;
-      if (!YT || !YT.Player) {
-        setTimeout(initPlayer, IFRAME_READY_TIMEOUT);
+      if (!YT?.Player) {
+        setTimeout(initPlayer, 100);
         return;
       }
 
-      // Clean up existing timer
       if (youtubeTimerRef.current) {
         clearInterval(youtubeTimerRef.current);
       }
 
-      // Create player instance (reusing existing iframe if possible)
       try {
         youtubePlayerRef.current = new YT.Player(playerId, {
           events: {
             onReady: (event: any) => {
-              console.log("YouTube player ready");
-
-              // Unmute the player after it's ready (video starts muted for autoplay to work)
               try {
+                event.target.playVideo();
                 event.target.unMute();
                 event.target.setVolume(100);
-                console.log("YouTube player unmuted");
               } catch (err) {
-                console.error("Error unmuting YouTube player:", err);
+                console.error("Error starting YouTube iframe playback:", err);
               }
 
-              // Start timing updates
               youtubeTimerRef.current = setInterval(() => {
                 try {
                   const currentTime = event.target.getCurrentTime();
                   const duration = event.target.getDuration();
-
-                  if (duration && currentTime !== undefined) {
-                    // Send timing to server using helper function
-                    sendTimingUpdate(currentTime, duration, now.id);
+                  if (isValidDuration(duration)) {
+                    sendTimingUpdate(currentTime || 0, duration, now.id);
                   }
                 } catch (err) {
-                  console.error("Error getting YouTube timing:", err);
+                  console.error("Error getting YouTube iframe timing:", err);
                 }
               }, 1000);
             },
             onStateChange: (event: any) => {
-              // YT.PlayerState.PLAYING = 1
               if (event.data === 1) {
-                // Ensure video is unmuted when playing starts
                 try {
                   if (event.target.isMuted()) {
                     event.target.unMute();
                     event.target.setVolume(100);
-                    console.log("YouTube player unmuted on play");
                   }
                 } catch (err) {
-                  console.error("Error unmuting YouTube player on play:", err);
+                  console.error("Error unmuting YouTube iframe:", err);
                 }
               }
-              // YT.PlayerState.ENDED = 0
               if (event.data === 0) {
-                console.log("YouTube video ended, sending final timing update");
-                // Guard against stale closure — verify the current song is still this one
-                if (!now) return;
                 try {
                   const duration = event.target.getDuration();
-                  if (isValidDuration(duration)) {
-                    // Send final timing update with currentTime = duration
-                    sendTimingUpdate(duration, duration, now.id);
-                  } else {
-                    // No valid duration from YouTube — send sentinel to force completion
-                    console.warn(
-                      "YouTube ended but no valid duration; sending sentinel timing update",
-                    );
-                    sendTimingUpdate(1, 1, now.id);
-                  }
+                  sendTimingUpdate(
+                    isValidDuration(duration) ? duration : 1,
+                    isValidDuration(duration) ? duration : 1,
+                    now.id,
+                  );
                 } catch (err) {
-                  console.error("Error sending final YouTube timing:", err);
-                  // If we can't get the duration after the video ends, still advance
-                  // to the next song so the session doesn't stall.
+                  console.error("Error sending final YouTube iframe timing:", err);
                   sendTimingUpdate(1, 1, now.id);
                 }
               }
             },
             onError: (event: any) => {
-              console.error("YouTube player error:", event.data);
+              console.error("YouTube iframe error:", {
+                code: event.data,
+                message: describeYouTubeIframeError(event.data),
+                videoId: youtubeVideoId,
+                url: now.external_url,
+                origin: window.location.origin,
+                referrer: document.referrer,
+                userAgent: navigator.userAgent,
+              });
               void fallbackYouTubeToDownloadedTrack(event.data);
             },
           },
         });
       } catch (err) {
-        console.error("Failed to initialize YouTube player:", err);
+        console.error("Failed to initialize YouTube iframe player:", err);
       }
     };
 
-    // Wait for iframe to be rendered in the DOM
-    setTimeout(initPlayer, INIT_DELAY);
+    const initTimer = setTimeout(initPlayer, 500);
 
     return () => {
+      clearTimeout(initTimer);
       if (youtubeTimerRef.current) {
         clearInterval(youtubeTimerRef.current);
+        youtubeTimerRef.current = null;
       }
       if (youtubePlayerRef.current) {
         try {
           youtubePlayerRef.current.stopVideo();
         } catch (err) {
-          console.warn("Failed to stop YouTube player in cleanup:", err);
+          console.warn("Failed to stop YouTube iframe player:", err);
         }
         youtubePlayerRef.current = null;
       }
@@ -1689,15 +1674,14 @@ export default function Player() {
         }}
       >
         <audio ref={breakAudioRef} preload="auto" style={{ display: "none" }} />
-        {/* YouTube iframe for YouTube videos */}
         {isYouTube && youtubeVideoId ? (
           <iframe
             key={youtubeVideoId}
             id={`youtube-player-${youtubeVideoId}`}
             ref={iframeRef}
-            src={`https://www.youtube.com/embed/${youtubeVideoId}?autoplay=1&mute=1&controls=0&showinfo=0&rel=0&modestbranding=1&fs=1&playsinline=1&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}`}
+            src={`https://www.youtube.com/embed/${youtubeVideoId}?autoplay=1&mute=1&controls=0&showinfo=0&rel=0&modestbranding=1&fs=1&playsinline=1&enablejsapi=1&origin=${encodeURIComponent(window.location.origin)}&widget_referrer=${encodeURIComponent(window.location.href)}`}
             referrerPolicy="strict-origin-when-cross-origin"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
             allowFullScreen
             style={{
               position: "absolute",
@@ -1710,11 +1694,15 @@ export default function Player() {
             }}
           />
         ) : (
-          // Video element for local and non-YouTube videos
           <video
             ref={videoRef}
             autoPlay
             playsInline
+            onError={() => {
+              if (now?.external_url && getYouTubeVideoId(now.external_url)) {
+                void fallbackYouTubeToDownloadedTrack("stream");
+              }
+            }}
             style={{
               position: "absolute",
               top: 0,
@@ -1728,7 +1716,7 @@ export default function Player() {
         )}
 
         {/* Play button overlay when autoplay is blocked (only for video element) */}
-        {!isYouTube && needsUserInteraction && !isPlaying && (
+        {needsUserInteraction && !isPlaying && (
           <div className="play-button-overlay" onClick={handlePlayClick}>
             <div className="play-icon" />
           </div>

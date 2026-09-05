@@ -222,7 +222,7 @@ async function snapshotMediaLibraryTrees(): Promise<MediaLibraryTreeSnapshot[]> 
 }
 
 async function snapshotDownloadFingerprints(): Promise<DirectoryFingerprint[]> {
-  const downloadLocation = (await getSetting('ytdlp.download_location')) || '/media/downloads';
+  const downloadLocation = (await getSetting('ytdlp.download_location')) || process.env.YTDLP_DOWNLOAD_LOCATION || '/media/downloads';
   return [
     await snapshotDirectoryFingerprint(downloadLocation, {
       recursive: false,

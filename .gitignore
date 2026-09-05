@@ -1,16 +1,67 @@
+# Dependencies
+node_modules/
 src/server/node_modules/
 src/web/node_modules/
+Station/node_modules/
+Gateway/node_modules/
+
+# Build and package outputs
+dist/
+build/
+out/
+.build/
+release/
+src/web/dist/
+Gateway/dist/
+Station/.build/
+Station/dist/
+Station/release/
+*.AppImage
+*.snap
+*.flatpak
+*.deb
+*.rpm
+
+# Generated TypeScript/React outputs
+*.tsbuildinfo
+src/web/src/**/*.js
+src/web/src/**/*.js.map
+src/web/src/**/*.d.ts.map
+
+# Test and coverage output
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+blob-report/
+junit*.xml
+coverage-final.json
+*.lcov
+
+# Logs and runtime state
+*.log
+logs/
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+db/
+Gateway/data/
+
+# Local environment/configuration
+.env
+.env.*
+!.env.example
+!Gateway/.env.example
+aio/.env
+
+# Local development scripts and scratch files
 dev/build-and-publish.sh
 dev/redeploy-webkaraoke.sh
 dev/test/
-build-and-publish.sh
-redeploy-webkaraoke.sh
-src/web/dist/assets/
-db/
-aio/.env
 dev/my-karaokedock.xml
 dev/To do
-dev/Screenshot_20260620-143255.png
+dev/Screenshot_*.png
 dev/install-dockerless.sh
-dev/Screenshot_20260626_140643.png
-dev/Screenshot_20260626_140618.png
+build-and-publish.sh
+redeploy-webkaraoke.sh

@@ -167,6 +167,7 @@ export async function upsertTrack(a: UpsertTrackArgs) {
  */
 export type InsertExternalTrackArgs = {
   artist_id: number | null;
+  disc_id?: string | null;
   title: string;
   external_url: string;
   source: string;
@@ -177,21 +178,22 @@ export async function upsertExternalTrack(a: InsertExternalTrackArgs) {
   const sql = `
     WITH existing AS (
       SELECT id FROM tracks
-      WHERE source = $4 AND external_url = $3
+      WHERE source = $5 AND external_url = $4
       LIMIT 1
     ),
     updated AS (
       UPDATE tracks t
       SET artist_id = COALESCE($1, t.artist_id),
-          title = COALESCE($2, t.title),
-          duration_ms = COALESCE($5, t.duration_ms)
+          disc_id = COALESCE($2, t.disc_id),
+          title = COALESCE($3, t.title),
+          duration_ms = COALESCE($6, t.duration_ms)
       FROM existing e
       WHERE t.id = e.id
       RETURNING t.*
     ),
     inserted AS (
-      INSERT INTO tracks (artist_id, title, kind, external_url, source, path, basename, duration_ms)
-      SELECT $1, $2, 'mp4', $3, $4, '', '', $5
+      INSERT INTO tracks (artist_id, disc_id, title, kind, external_url, source, path, basename, duration_ms)
+      SELECT $1, $2, $3, 'mp4', $4, $5, '', '', $6
       WHERE NOT EXISTS (SELECT 1 FROM existing)
       RETURNING *
     )
@@ -201,7 +203,7 @@ export async function upsertExternalTrack(a: InsertExternalTrackArgs) {
     LIMIT 1;
   `;
   
-  const res = await query(sql, [a.artist_id, a.title, a.external_url, a.source, a.duration_ms || null]);
+  const res = await query(sql, [a.artist_id, a.disc_id || null, a.title, a.external_url, a.source, a.duration_ms || null]);
   return res.rows[0];
 }
 

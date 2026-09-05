@@ -181,6 +181,31 @@ export async function ensureSingerInActiveRotation(singerId: bigint): Promise<vo
     rotationId = BigInt(rotRes.rows[0].id);
   }
 
+  await query(
+    `DELETE FROM rotation_singers rs
+      WHERE rs.rotation_id = $1
+        AND rs.singer_id = $2
+        AND rs.id <> (
+          SELECT MIN(id)
+            FROM rotation_singers
+           WHERE rotation_id = $1
+             AND singer_id = $2
+        )`,
+    [rotationId, singerId],
+  );
+
+  const existing = await query<{ id: string }>(
+    `UPDATE rotation_singers
+        SET status = 'active'
+      WHERE rotation_id = $1
+        AND singer_id = $2
+      RETURNING id`,
+    [rotationId, singerId],
+  );
+  if (existing.rows.length > 0) {
+    return;
+  }
+
   // Determine the next available position
   const posRes = await query<{ max_pos: number | null }>(
     `SELECT MAX(position) AS max_pos FROM rotation_singers WHERE rotation_id = $1`,

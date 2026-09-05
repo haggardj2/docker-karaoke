@@ -9,6 +9,7 @@ import React, {
 import { createPortal } from "react-dom";
 import { api } from "../api";
 import { useAuth } from "../auth-context";
+import "./Requests.css";
 
 const MIN_KEY_ADJUSTMENT = -6;
 const MAX_KEY_ADJUSTMENT = 6;
@@ -40,6 +41,38 @@ type MyQueueItem = {
 };
 
 type BrowseCategory = "artist" | "title";
+
+type BrowseArtistRow = {
+  artist: string;
+  songCount?: number;
+  versionCount?: number;
+};
+
+type CombinedSearchTrack =
+  | {
+      type: "local";
+      key: string;
+      title: string;
+      artist: string;
+      discId: string | null;
+      kind: string | null;
+      track: SearchRow;
+    }
+  | {
+      type: "online";
+      key: string;
+      title: string;
+      artist: string;
+      brand: string | null;
+      track: KaraokeNerdsTrack;
+    };
+
+type CombinedSearchGroup = {
+  key: string;
+  title: string;
+  artist: string;
+  versions: CombinedSearchTrack[];
+};
 
 function normalizeMyQueueItems(items: unknown): MyQueueItem[] {
   if (!Array.isArray(items)) return [];
@@ -187,6 +220,30 @@ export default function Requests() {
     auth.profile.username ||
     ""
   ).trim();
+  const isSignedInRequester =
+    auth.isLoggedIn && Boolean(auth.sessionToken) && Boolean(signedInRequestName);
+  const requestSingerUuid = isSignedInRequester ? undefined : singerUuid;
+  const requesterHeaders = useMemo<Record<string, string>>(
+    () => {
+      const headers: Record<string, string> = {};
+      if (isSignedInRequester) {
+        headers["x-session-token"] = auth.sessionToken;
+      }
+      return headers;
+    },
+    [auth.sessionToken, isSignedInRequester],
+  );
+  const requesterJsonHeaders = useMemo<Record<string, string>>(
+    () => ({ ...requesterHeaders, "Content-Type": "application/json" }),
+    [requesterHeaders],
+  );
+  const buildRequesterParams = useCallback(() => {
+    const params = new URLSearchParams({ name: requestedBy.trim() });
+    if (requestSingerUuid) {
+      params.set("singerUuid", requestSingerUuid);
+    }
+    return params;
+  }, [requestedBy, requestSingerUuid]);
   const [keyAdjustments, setKeyAdjustments] = useState<Map<string, number>>(
     new Map(),
   );
@@ -204,7 +261,7 @@ export default function Requests() {
     useState<BrowseCategory>("artist");
   const [browseLetters, setBrowseLetters] = useState<string[]>([]);
   const [selectedBrowseLetter, setSelectedBrowseLetter] = useState("");
-  const [browseArtists, setBrowseArtists] = useState<string[]>([]);
+  const [browseArtists, setBrowseArtists] = useState<BrowseArtistRow[]>([]);
   const [selectedBrowseArtist, setSelectedBrowseArtist] = useState("");
   const [browseSummary, setBrowseSummary] = useState("");
   const [addingLocal, setAddingLocal] = useState<number | null>(null);
@@ -291,10 +348,16 @@ export default function Requests() {
     artist: string;
     versions: KaraokeNerdsTrack[];
   } | null>(null);
+  const [combinedVersionPicker, setCombinedVersionPicker] = useState<{
+    title: string;
+    artist: string;
+    versions: CombinedSearchTrack[];
+  } | null>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const actionMenuRef = useRef<HTMLDivElement | null>(null);
   const lyricsPopupRef = useRef<HTMLDivElement | null>(null);
+  const browseArtistScrollYRef = useRef(0);
 
   // Request acceptance settings
   const [requestAcceptance, setRequestAcceptance] = useState<
@@ -664,9 +727,11 @@ export default function Requests() {
             )
           : [];
         setBrowseLetters(letters);
-        setSelectedBrowseLetter((current) =>
-          letters.includes(current) ? current : "",
-        );
+        setSelectedBrowseLetter((current) => {
+          if (letters.includes(current)) return current;
+          if (letters.includes("#")) return "#";
+          return letters[0] ?? "";
+        });
       } catch (err) {
         console.error("Browse letters error:", err);
         setBrowseLetters([]);
@@ -689,12 +754,35 @@ export default function Requests() {
         const result = await api(
           `/api/search/browse/artists?letter=${encodeURIComponent(letter)}${kindQuery}`,
         );
-        const artists = Array.isArray(result?.artists)
-          ? result.artists.filter(
-              (value: unknown): value is string =>
-                typeof value === "string" && value.trim().length > 0,
-            )
+        const rawArtists: unknown[] = Array.isArray(result?.artists)
+          ? result.artists
           : [];
+        const artists = rawArtists
+              .map((value: unknown): BrowseArtistRow | null => {
+                if (typeof value === "string") {
+                  const artist = value.trim();
+                  return artist ? { artist } : null;
+                }
+                if (!value || typeof value !== "object") return null;
+                const row = value as {
+                  artist?: unknown;
+                  songCount?: unknown;
+                  versionCount?: unknown;
+                };
+                if (typeof row.artist !== "string" || !row.artist.trim()) {
+                  return null;
+                }
+                const songCount = Number(row.songCount);
+                const versionCount = Number(row.versionCount);
+                return {
+                  artist: row.artist.trim(),
+                  songCount: Number.isFinite(songCount) ? songCount : undefined,
+                  versionCount: Number.isFinite(versionCount)
+                    ? versionCount
+                    : undefined,
+                };
+              })
+              .filter((value): value is BrowseArtistRow => value !== null);
         setBrowseArtists(artists);
       } catch (err) {
         console.error("Browse artists error:", err);
@@ -895,8 +983,8 @@ export default function Requests() {
     try {
       const result = await api("/api/singers/self/name", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, singerUuid }),
+        headers: requesterJsonHeaders,
+        body: JSON.stringify({ name, singerUuid: requestSingerUuid }),
       });
       if (typeof result?.singer?.uuid === "string") {
         localStorage.setItem(SINGER_UUID_STORAGE_KEY, result.singer.uuid);
@@ -964,6 +1052,88 @@ export default function Requests() {
     return Array.from(map.values());
   }, [karaokeNerdsRows]);
 
+  const combinedSearchGroups = useMemo((): CombinedSearchGroup[] => {
+    const tracks: CombinedSearchTrack[] = [];
+    if (localLibraryEnabled && sourceFilter !== "online") {
+      for (const row of localRows) {
+        tracks.push({
+          type: "local",
+          key: `local-${row.id}`,
+          title: row.title ?? "",
+          artist: row.artist ?? "",
+          discId: row.disc_id,
+          kind: row.kind,
+          track: row,
+        });
+      }
+    }
+    if (externalLibraryEnabled && sourceFilter !== "local") {
+      for (const track of karaokeNerdsRows) {
+        tracks.push({
+          type: "online",
+          key: `kn-${track.url}`,
+          title: track.title ?? "",
+          artist: track.artist ?? "",
+          brand: track.brand ?? null,
+          track,
+        });
+      }
+    }
+
+    const deduped = new Map<string, CombinedSearchTrack>();
+    for (const track of tracks) {
+      const dedupeKey =
+        track.type === "online"
+          ? `online:${track.track.url.trim().toLowerCase().replace(/\/+$/, "")}`
+          : `local:${track.track.id}`;
+      if (!deduped.has(dedupeKey)) deduped.set(dedupeKey, track);
+    }
+
+    const groups = new Map<string, CombinedSearchGroup>();
+    for (const track of deduped.values()) {
+      const key = groupKey(track.title, track.artist);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          title: track.title,
+          artist: track.artist,
+          versions: [],
+        });
+      }
+      groups.get(key)!.versions.push(track);
+    }
+
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        versions: group.versions.sort((a, b) => {
+          const aVersion = a.type === "online" ? a.brand ?? "" : a.discId ?? "";
+          const bVersion = b.type === "online" ? b.brand ?? "" : b.discId ?? "";
+          return aVersion.localeCompare(bVersion, undefined, {
+            sensitivity: "base",
+            numeric: true,
+          });
+        }),
+      }))
+      .sort((a, b) => {
+        const artistCompare = a.artist.localeCompare(b.artist, undefined, {
+          sensitivity: "base",
+          numeric: true,
+        });
+        if (artistCompare !== 0) return artistCompare;
+        return a.title.localeCompare(b.title, undefined, {
+          sensitivity: "base",
+          numeric: true,
+        });
+      });
+  }, [
+    localRows,
+    karaokeNerdsRows,
+    localLibraryEnabled,
+    externalLibraryEnabled,
+    sourceFilter,
+  ]);
+
   const loadMyQueue = useCallback(async () => {
     const name = requestedBy.trim();
     if (!name) {
@@ -972,9 +1142,9 @@ export default function Requests() {
     }
     setMyQueueLoading(true);
     try {
-      const params = new URLSearchParams({ name, singerUuid });
       const items = await api(
-        `/api/queue/by-requester?${params.toString()}`,
+        `/api/queue/by-requester?${buildRequesterParams().toString()}`,
+        { headers: requesterHeaders },
       );
       setMyQueue(normalizeMyQueueItems(items));
     } catch {
@@ -982,7 +1152,7 @@ export default function Requests() {
     } finally {
       setMyQueueLoading(false);
     }
-  }, [requestedBy, singerUuid]);
+  }, [buildRequesterParams, requestedBy, requesterHeaders]);
 
   useEffect(() => {
     void loadMyQueue();
@@ -1140,8 +1310,8 @@ export default function Requests() {
     setRemovingQueueId(queueId);
     try {
       await api(
-        `/api/queue/${queueId}/self-remove?${new URLSearchParams({ name, singerUuid }).toString()}`,
-        { method: "DELETE" },
+        `/api/queue/${queueId}/self-remove?${buildRequesterParams().toString()}`,
+        { method: "DELETE", headers: requesterHeaders },
       );
       await loadMyQueue();
       setRevealedRemoveQueueId(null);
@@ -1161,8 +1331,8 @@ export default function Requests() {
     try {
       await api(`/api/queue/${queueId}/self-requeue`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, singerUuid }),
+        headers: requesterJsonHeaders,
+        body: JSON.stringify({ name, singerUuid: requestSingerUuid }),
       });
       await loadMyQueue();
       showToast(`Added "${songTitle || "Unknown"}" back to ${name}'s queue`);
@@ -1184,7 +1354,8 @@ export default function Requests() {
     if (!name) return;
     try {
       const data = await api(
-        `/api/history/self/export?${new URLSearchParams({ name, singerUuid }).toString()}`,
+        `/api/history/self/export?${buildRequesterParams().toString()}`,
+        { headers: requesterHeaders },
       );
       downloadJsonFile(safeHistoryFilename(name), data);
       showToast("Singer history exported");
@@ -1201,8 +1372,8 @@ export default function Requests() {
       const data = await readJsonFile(file);
       const result = await api("/api/history/self/import", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, singerUuid, data }),
+        headers: requesterJsonHeaders,
+        body: JSON.stringify({ name, singerUuid: requestSingerUuid, data }),
       });
       await loadMyQueue();
       showToast(
@@ -1243,8 +1414,8 @@ export default function Requests() {
     try {
       await api("/api/queue/self-reorder", {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, singerUuid, queueIds: orderedIds }),
+        headers: requesterJsonHeaders,
+        body: JSON.stringify({ name, singerUuid: requestSingerUuid, queueIds: orderedIds }),
       });
       await loadMyQueue();
       showToast("Queue order updated");
@@ -1272,11 +1443,11 @@ export default function Requests() {
     try {
       await api("/api/queue", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requesterJsonHeaders,
         body: JSON.stringify({
           trackId: id,
           requestedBy: name,
-          singerUuid,
+          singerUuid: requestSingerUuid,
           keyAdjustment: keyAdjustment,
         }),
       });
@@ -1330,13 +1501,13 @@ export default function Requests() {
     try {
       await api("/api/karaoke-nerds/add", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: requesterJsonHeaders,
         body: JSON.stringify({
           title: track.title,
           artist: track.artist,
           url: track.url,
           requestedBy: name,
-          singerUuid,
+          singerUuid: requestSingerUuid,
           keyAdjustment: keyAdjustment,
         }),
       });
@@ -1375,1350 +1546,14 @@ export default function Requests() {
   }
 
   return (
-    <div className="requests-page">
-      <style>{`
-        /* Import Inter font */
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    <div className="requests-page request-page-gateway-theme">
 
-        /* Animations */
-        @keyframes fadeInUp {
-          from {
-            opacity: 0;
-            transform: translateY(20px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-
-        @keyframes slideUpDrawer {
-          from {
-            transform: translateY(100%);
-          }
-          to {
-            transform: translateY(0);
-          }
-        }
-
-        @keyframes slideIn {
-          from {
-            transform: translateX(-10px);
-            opacity: 0;
-          }
-          to {
-            transform: translateX(0);
-            opacity: 1;
-          }
-        }
-
-        @keyframes pulse {
-          0%, 100% {
-            opacity: 1;
-          }
-          50% {
-            opacity: 0.5;
-          }
-        }
-
-        @keyframes spin {
-          to {
-            transform: rotate(360deg);
-          }
-        }
-
-        @keyframes ripple {
-          to {
-            transform: scale(1. 5);
-            opacity: 0;
-          }
-        }
-
-        @keyframes toastSlide {
-          from {
-            transform: translateY(100%);
-            opacity: 0;
-          }
-          to {
-            transform: translateY(0);
-            opacity: 1;
-          }
-        }
-
-        /* Base styles */
-        .requests-page {
-          min-height: 100vh;
-          padding: 16px;
-          padding-bottom: calc(72px + env(safe-area-inset-bottom, 16px));
-          animation: fadeInUp 0.5s ease;
-        }
-
-        .container {
-          max-width: 768px;
-          margin: 0 auto;
-        }
-
-        /* Header */
-        .header {
-          text-align: center;
-          margin-bottom: 32px;
-          animation: fadeInUp 0.6s ease;
-        }
-
-        .header-title {
-          font-size: clamp(28px, 5vw, 40px);
-          font-weight: 700;
-          margin: 0 0 8px 0;
-          background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-          letter-spacing: -0.02em;
-        }
-
-        .header-subtitle {
-          color: var(--color-text-secondary);
-          font-size: clamp(14px, 2.5vw, 16px);
-          margin: 0;
-        }
-
-        /* Cards */
-        .card {
-          background: var(--color-bg-card);
-          border: 1px solid var(--color-border);
-          border-radius: 20px;
-          padding: 24px;
-          margin-bottom: 20px;
-          box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
-          backdrop-filter: blur(10px);
-          animation: fadeInUp 0.6s ease backwards;
-          overflow: hidden;
-        }
-
-        .card:nth-child(2) {
-          animation-delay: 0.1s;
-        }
-
-        .card:nth-child(3) {
-          animation-delay: 0.2s;
-        }
-
-        /* Singer Input Card */
-        .singer-card {
-          position: relative;
-          overflow: hidden;
-        }
-
-        .singer-card::before {
-          content: '';
-          position: absolute;
-          top: -2px;
-          left: -2px;
-          right: -2px;
-          bottom: -2px;
-          background: linear-gradient(45deg, #6366f1, #a855f7, #ec4899, #6366f1);
-          background-size: 300% 300%;
-          border-radius: 20px;
-          opacity: 0;
-          transition: opacity 0.3s ease;
-          animation: gradient 4s ease infinite;
-          z-index: -1;
-        }
-
-        @keyframes gradient {
-          0%, 100% { background-position: 0% 50%; }
-          50% { background-position: 100% 50%; }
-        }
-
-        .singer-card. has-name::before {
-          opacity: 0.3;
-        }
-
-        .input-group {
-          margin-bottom: 16px;
-        }
-
-        . input-label {
-          display: block;
-          font-size: 14px;
-          font-weight: 500;
-          color: var(--color-text-secondary);
-          margin-bottom: 8px;
-          transition: color 0.3s ease;
-        }
-
-        .input-wrapper {
-          position: relative;
-          width: 100%;
-          max-width: 100%;
-          box-sizing: border-box;
-        }
-
-        .input-field {
-          width: 100%;
-          padding: 14px 16px;
-          padding-left: 44px;
-          background: var(--color-bg-secondary);
-          border: 2px solid var(--color-border);
-          border-radius: 12px;
-          color: var(--color-text-primary);
-          font-size: 16px;
-          font-weight: 500;
-          transition: all 0.3s ease;
-          outline: none;
-          box-sizing: border-box;
-        }
-
-        .input-field:focus {
-          border-color: var(--color-accent);
-          box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
-          transform: translateY(-2px);
-        }
-
-        .input-field::placeholder {
-          color: var(--color-text-muted);
-        }
-
-        .input-icon {
-          position: absolute;
-          left: 16px;
-          top: 50%;
-          transform: translateY(-50%);
-          font-size: 20px;
-          transition: transform 0.3s ease;
-        }
-
-        .input-field:focus + .input-icon {
-          transform: translateY(-50%) scale(1.1);
-        }
-
-        /* Singer Badge */
-        .singer-badge {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          background: linear-gradient(135deg, rgba(99, 102, 241, 0.2), rgba(168, 85, 247, 0.2));
-          border: 1px solid rgba(99, 102, 241, 0.4);
-          border-radius: 100px;
-          padding: 10px 16px;
-          font-size: 14px;
-          font-weight: 600;
-          animation: slideIn 0.3s ease;
-        }
-
-        .singer-badge-icon {
-          font-size: 18px;
-          animation: pulse 2s ease infinite;
-        }
-
-        /* Name Prompt */
-        .name-prompt {
-          background: linear-gradient(135deg, rgba(239, 68, 68, 0.1), rgba(245, 158, 11, 0.1));
-          border: 1px solid rgba(239, 68, 68, 0.3);
-          border-radius: 12px;
-          padding: 12px 16px;
-          margin-bottom: 16px;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          animation: slideIn 0.3s ease;
-        }
-
-        .name-prompt-icon {
-          font-size: 20px;
-          animation: pulse 1.5s ease infinite;
-        }
-
-        .name-prompt-text {
-          flex: 1;
-          font-size: 14px;
-          font-weight: 500;
-        }
-
-        /* Search Mode Toggle - FIXED SELECTORS WITHOUT SPACES */
-        .search-mode-toggle {
-          display: flex;
-          flex-direction: row;
-          gap: 8px;
-          background: transparent;
-          padding: 0;
-          margin-bottom: 20px;
-        }
-
-        .mode-button {
-          flex: 1;
-          padding: 12px 16px;
-          border: none;
-          border-radius: 12px;
-          background: var(--color-bg-secondary);
-          color: var(--color-text-secondary);
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 6px;
-          border: 1px solid var(--color-border);
-        }
-
-        /* Active state - NO SPACES IN SELECTOR */
-        .mode-button.active {
-          background: linear-gradient(135deg, #6366f1, #818cf8);
-          color: white;
-          border-color: transparent;
-          box-shadow: 0 2px 8px rgba(99, 102, 241, 0. 3);
-        }
-
-        /* Active state for Karaoke Nerds - NO SPACES IN SELECTOR */
-        .mode-button.active. karaoke-nerds {
-          background: linear-gradient(135deg, #7c3aed, #a855f7);
-          box-shadow: 0 2px 8px rgba(124, 58, 237, 0.3);
-        }
-
-        . mode-button:not(.active):hover {
-          background: var(--color-bg-hover);
-          color: var(--color-text-primary);
-          border-color: var(--color-accent);
-        }
-
-        .mode-icon {
-          font-size: 16px;
-        }
-
-        /* Search Input */
-        .search-wrapper {
-          position: relative;
-          margin-bottom: 20px;
-        }
-
-        .search-input {
-          width: 100%;
-          padding: 16px 20px;
-          padding-left: 48px;
-          padding-right: 48px;
-          background: var(--color-bg-secondary);
-          border: 2px solid var(--color-border);
-          border-radius: 16px;
-          color: var(--color-text-primary);
-          font-size: 16px;
-          font-weight: 500;
-          transition: all 0.3s ease;
-          outline: none;
-        }
-
-        .search-input:focus {
-          border-color: var(--color-accent);
-          box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.1);
-          transform: translateY(-2px);
-        }
-
-        .search-icon {
-          position: absolute;
-          left: 18px;
-          top: 50%;
-          transform: translateY(-50%);
-          font-size: 20px;
-          color: var(--color-text-muted);
-          transition: color 0.3s ease;
-        }
-
-        .search-input:focus ~ .search-icon {
-          color: var(--color-accent);
-        }
-
-        . search-clear {
-          position: absolute;
-          right: 16px;
-          top: 50%;
-          transform: translateY(-50%);
-          padding: 4px;
-          background: transparent;
-          border: none;
-          color: var(--color-text-muted);
-          font-size: 20px;
-          cursor: pointer;
-          opacity: 0;
-          visibility: hidden;
-          transition: all 0.3s ease;
-          line-height: 1;
-        }
-
-        .search-clear. visible {
-          opacity: 1;
-          visibility: visible;
-        }
-
-        .search-clear:hover {
-          color: var(--color-text-primary);
-        }
-
-        /* Search Filters */
-        .search-filters {
-          margin-top: 16px;
-          animation: fadeInUp 0.3s ease;
-        }
-
-        .filter-toggle {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          padding: 10px 14px;
-          background: var(--color-bg-secondary);
-          border: 1px solid var(--color-border);
-          border-radius: 10px;
-          color: var(--color-text-secondary);
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          width: fit-content;
-        }
-
-        .filter-toggle:hover {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-          color: var(--color-text-primary);
-        }
-
-        .filter-icon {
-          font-size: 16px;
-        }
-
-        .filter-chevron {
-          font-size: 10px;
-          margin-left: 4px;
-          transition: transform 0.3s ease;
-        }
-
-        .filter-options {
-          margin-top: 12px;
-          padding: 16px;
-          background: var(--color-bg-secondary);
-          border: 1px solid var(--color-border);
-          border-radius: 12px;
-          animation: slideIn 0.3s ease;
-        }
-
-        .filter-group {
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-        }
-
-        .filter-label {
-          font-size: 13px;
-          font-weight: 600;
-          color: var(--color-text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        }
-
-        .filter-chips {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 8px;
-        }
-
-        .filter-chip {
-          padding: 8px 14px;
-          background: var(--color-bg-primary);
-          border: 1px solid var(--color-border);
-          border-radius: 20px;
-          color: var(--color-text-secondary);
-          font-size: 13px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          display: flex;
-          align-items: center;
-          gap: 4px;
-        }
-
-        .filter-chip:hover {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-          color: var(--color-text-primary);
-          transform: translateY(-1px);
-        }
-
-        .filter-chip.active {
-          background: linear-gradient(135deg, #6366f1, #818cf8);
-          border-color: transparent;
-          color: white;
-          box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3);
-        }
-
-        .filter-chip.active:hover {
-          background: linear-gradient(135deg, #7c7ff3, #8b91f9);
-          transform: translateY(-2px);
-          box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
-        }
-
-        /* Loading State */
-        .loading-container {
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          padding: 48px 24px;
-          gap: 16px;
-        }
-
-        . loading-spinner {
-          width: 40px;
-          height: 40px;
-          border: 3px solid var(--color-border);
-          border-top-color: var(--color-accent);
-          border-radius: 50%;
-          animation: spin 0.8s linear infinite;
-        }
-
-        . loading-text {
-          color: var(--color-text-secondary);
-          font-size: 14px;
-          font-weight: 500;
-        }
-
-        /* Results Header */
-        .results-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 12px 0;
-          margin-bottom: 12px;
-          border-bottom: 1px solid var(--color-border);
-          animation: fadeInUp 0.3s ease;
-        }
-
-        .results-count {
-          font-size: 13px;
-          font-weight: 600;
-          color: var(--color-text-secondary);
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        }
-
-        .active-filter-badge {
-          padding: 4px 10px;
-          background: linear-gradient(135deg, #6366f1, #818cf8);
-          border-radius: 12px;
-          font-size: 12px;
-          font-weight: 600;
-          color: white;
-          display: inline-flex;
-          align-items: center;
-          gap: 4px;
-        }
-
-        /* Results - UPDATED WITH RIGHT-SIDE SMALL BUTTON */
-        .results-container {
-          animation: fadeInUp 0.4s ease;
-        }
-
-        .result-card {
-          background: var(--color-bg-secondary);
-          border: 1px solid var(--color-border);
-          border-radius: 16px;
-          padding: 12px;
-          margin-bottom: 12px;
-          transition: all 0.3s ease;
-          position: relative;
-          overflow: visible;
-          display: flex;
-          align-items: center;
-          gap: 12px;
-        }
-
-        . result-card:hover {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-          transform: translateX(4px);
-          box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-        }
-
-        .result-number {
-          min-width: 36px;
-          height: 36px;
-          background: var(--color-accent);
-          border-radius: 10px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-weight: 700;
-          font-size: 16px;
-          color: white;
-        }
-
-        .result-info {
-          flex: 1;
-          min-width: 0;
-        }
-
-        .result-title {
-          font-weight: 600;
-          font-size: 16px;
-          margin-bottom: 2px;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-          color: var(--color-text-primary);
-        }
-
-        .result-artist {
-          font-size: 14px;
-          color: var(--color-text-secondary);
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-          margin-bottom: 6px;
-        }
-
-        . result-meta {
-          display: flex;
-          gap: 6px;
-          flex-wrap: wrap;
-        }
-
-        .meta-tag {
-          display: inline-block;
-          padding: 2px 6px;
-          background: var(--color-bg-primary);
-          border-radius: 4px;
-          font-size: 11px;
-          font-weight: 500;
-          color: var(--color-text-muted);
-        }
-
-        .meta-tag. brand {
-          background: rgba(124, 58, 237, 0.2);
-          color: #a855f7;
-        }
-
-        /* Add Button - Smaller and on the right */
-        .add-button {
-          padding: 8px 16px;
-          background: linear-gradient(135deg, #6366f1, #8b5cf6);
-          border: none;
-          border-radius: 10px;
-          color: white;
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          position: relative;
-          overflow: hidden;
-          white-space: nowrap;
-          min-width: 80px;
-        }
-
-        .add-button::before {
-          content: '';
-          position: absolute;
-          top: 50%;
-          left: 50%;
-          width: 0;
-          height: 0;
-          background: rgba(255, 255, 255, 0.3);
-          border-radius: 50%;
-          transform: translate(-50%, -50%);
-          transition: width 0.6s, height 0.6s;
-        }
-
-        .add-button:active::before {
-          width: 200px;
-          height: 200px;
-        }
-
-        . add-button:hover:not(:disabled) {
-          transform: translateY(-2px);
-          box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
-        }
-
-        .add-button:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-          transform: none;
-        }
-
-        . add-button.karaoke-nerds {
-          background: linear-gradient(135deg, #7c3aed, #a855f7);
-        }
-
-        . add-button.karaoke-nerds:hover:not(:disabled) {
-          box-shadow: 0 6px 20px rgba(124, 58, 237, 0. 4);
-        }
-
-        . add-button.success {
-          background: var(--color-success);
-          pointer-events: none;
-        }
-
-        .add-button-content {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 4px;
-        }
-
-        . button-spinner {
-          width: 14px;
-          height: 14px;
-          border: 2px solid rgba(255, 255, 255, 0.3);
-          border-top-color: white;
-          border-radius: 50%;
-          animation: spin 0.6s linear infinite;
-        }
-
-        /* Button Container - Flex container for key button and add button */
-        .button-container {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          position: relative;
-        }
-
-        /* Action Menu Button - Single button to open menu */
-        .action-menu-button {
-          padding: 8px 16px;
-          background: linear-gradient(135deg, #6366f1, #8b5cf6);
-          border: none;
-          border-radius: 10px;
-          color: white;
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.3s ease;
-          position: relative;
-          overflow: hidden;
-          white-space: nowrap;
-          min-width: 80px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 6px;
-        }
-
-        .action-menu-button:hover:not(:disabled) {
-          transform: translateY(-2px);
-          box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
-        }
-
-        .action-menu-button:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-          transform: none;
-        }
-
-        .action-menu-button.karaoke-nerds {
-          background: linear-gradient(135deg, #7c3aed, #a855f7);
-        }
-
-        .action-menu-button.karaoke-nerds:hover:not(:disabled) {
-          box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
-        }
-
-        .action-menu-button.success {
-          background: var(--color-success);
-          pointer-events: none;
-        }
-
-        /* Action Menu Overlay for mobile */
-        .action-menu-overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background: rgba(0, 0, 0, 0.6);
-          z-index: 999;
-          animation: fadeIn 0.3s ease;
-          display: none;
-        }
-
-        @media (max-width: 640px) {
-          .action-menu-overlay {
-            display: block;
-          }
-        }
-
-        @keyframes fadeIn {
-          from { opacity: 0; }
-          to { opacity: 1; }
-        }
-
-        /* Action Menu Container - Desktop popup */
-        .action-menu {
-          position: fixed;
-          background: var(--color-bg-card);
-          border: 1px solid var(--color-border);
-          border-radius: 12px;
-          padding: 8px;
-          min-width: 200px;
-          z-index: 1001;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-          animation: slideInDown 0.2s ease;
-        }
-
-        @keyframes slideInDown {
-          from {
-            opacity: 0;
-            transform: translateY(-10px);
-          }
-          to {
-            opacity: 1;
-            transform: translateY(0);
-          }
-        }
-
-        /* Mobile: Bottom sheet */
-        @media (max-width: 640px) {
-          .action-menu {
-            position: fixed;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            top: auto;
-            border-radius: 20px 20px 0 0;
-            padding: 20px;
-            padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
-            animation: slideInUp 0.3s ease;
-            max-width: 100%;
-            max-height: 80vh;
-            overflow-y: auto;
-            z-index: 1001;
-          }
-
-          @keyframes slideInUp {
-            from {
-              transform: translateY(100%);
-            }
-            to {
-              transform: translateY(0);
-            }
-          }
-        }
-
-        .action-menu-header {
-          padding: 8px 12px;
-          border-bottom: 1px solid var(--color-border);
-          margin-bottom: 8px;
-        }
-
-        .action-menu-title {
-          font-size: 14px;
-          font-weight: 600;
-          color: var(--color-text-primary);
-          margin: 0;
-        }
-
-        .action-menu-subtitle {
-          font-size: 12px;
-          color: var(--color-text-secondary);
-          margin: 4px 0 0 0;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-
-        .action-menu-items {
-          display: flex;
-          flex-direction: column;
-          gap: 4px;
-        }
-
-        .action-menu-item {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          padding: 12px;
-          background: transparent;
-          border: none;
-          border-radius: 8px;
-          color: var(--color-text-primary);
-          font-size: 14px;
-          font-weight: 500;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          text-align: left;
-          width: 100%;
-        }
-
-        .action-menu-item:hover {
-          background: var(--color-bg-hover);
-        }
-
-        .action-menu-item-icon {
-          font-size: 20px;
-          width: 24px;
-          text-align: center;
-        }
-
-        .action-menu-item-content {
-          flex: 1;
-          min-width: 0;
-        }
-
-        .action-menu-item-label {
-          display: block;
-          font-weight: 600;
-        }
-
-        .action-menu-item-description {
-          display: block;
-          font-size: 12px;
-          color: var(--color-text-secondary);
-          margin-top: 2px;
-        }
-
-        .action-menu-item-value {
-          font-size: 12px;
-          color: var(--color-text-secondary);
-          white-space: nowrap;
-        }
-
-        .action-menu-item.primary {
-          background: linear-gradient(135deg, #6366f1, #8b5cf6);
-          color: white;
-        }
-
-        .action-menu-item.primary:hover {
-          background: linear-gradient(135deg, #7c7ff3, #9d6ff7);
-        }
-
-        .action-menu-item.primary .action-menu-item-description {
-          color: rgba(255, 255, 255, 0.8);
-        }
-
-        /* Key Adjustment View within Action Menu */
-        .key-adjustment-view {
-          padding: 16px 12px;
-          border-top: 1px solid var(--color-border);
-          margin-top: 4px;
-        }
-
-        .key-adjustment-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          margin-bottom: 16px;
-        }
-
-        .key-adjustment-back {
-          background: transparent;
-          border: none;
-          color: var(--color-text-secondary);
-          font-size: 14px;
-          font-weight: 600;
-          cursor: pointer;
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          padding: 6px 10px;
-          border-radius: 6px;
-          transition: all 0.2s ease;
-        }
-
-        .key-adjustment-back:hover {
-          background: var(--color-bg-hover);
-          color: var(--color-text-primary);
-        }
-
-        .key-adjustment-title {
-          font-size: 14px;
-          font-weight: 600;
-          color: var(--color-text-primary);
-        }
-
-        .key-adjustment-controls {
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 16px;
-          padding: 20px 0;
-        }
-
-        .key-adjustment-button {
-          width: 52px;
-          height: 52px;
-          border-radius: 12px;
-          border: 2px solid var(--color-border);
-          background: var(--color-bg-secondary);
-          color: var(--color-text-primary);
-          font-size: 24px;
-          font-weight: 700;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-        }
-
-        .key-adjustment-button:hover:not(:disabled) {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-          transform: scale(1.05);
-        }
-
-        .key-adjustment-button:disabled {
-          opacity: 0.3;
-          cursor: not-allowed;
-        }
-
-        .key-adjustment-display {
-          min-width: 100px;
-          text-align: center;
-        }
-
-        .key-adjustment-value {
-          font-weight: 700;
-          font-size: 24px;
-          color: var(--color-text-primary);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 8px;
-        }
-
-        .key-adjustment-label {
-          font-size: 12px;
-          color: var(--color-text-secondary);
-          margin-top: 4px;
-        }
-
-        /* Mobile optimizations for action menu */
-        @media (max-width: 640px) {
-          .action-menu-item {
-            padding: 16px;
-          }
-
-          .action-menu-header {
-            padding: 12px 0;
-            margin-bottom: 12px;
-          }
-
-          .action-menu-title {
-            font-size: 16px;
-          }
-
-          .key-adjustment-controls {
-            padding: 24px 0;
-          }
-
-          .key-adjustment-button {
-            width: 60px;
-            height: 60px;
-            font-size: 28px;
-          }
-
-          .key-adjustment-value {
-            font-size: 28px;
-          }
-        }
-
-        /* Lyrics Button */
-        .lyrics-button {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          padding: 8px 10px;
-          background: var(--color-bg-primary);
-          border: 1px solid var(--color-border);
-          border-radius: 8px;
-          color: var(--color-text-primary);
-          font-weight: 600;
-          cursor: pointer;
-          font-size: 14px;
-        }
-
-        .lyrics-button:hover {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-        }
-
-        /* Lyrics Popup/Modal */
-        .lyrics-popup-overlay {
-          position: fixed;
-          top: 0;
-          left: 0;
-          right: 0;
-          bottom: 0;
-          background: rgba(0, 0, 0, 0.8);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          z-index: 1200;
-          padding: 20px;
-          animation: fadeInUp 0.3s ease;
-        }
-
-        .lyrics-popup {
-          background: var(--color-bg-card);
-          border: 1px solid var(--color-border);
-          border-radius: 16px;
-          padding: 24px;
-          max-width: 600px;
-          width: 100%;
-          max-height: 80vh;
-          overflow-y: auto;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-          animation: slideIn 0.3s ease;
-          z-index: 1201;
-        }
-
-        .lyrics-header {
-          display: flex;
-          justify-content: space-between;
-          align-items: flex-start;
-          margin-bottom: 20px;
-          padding-bottom: 16px;
-          border-bottom: 1px solid var(--color-border);
-        }
-
-        .lyrics-title-info {
-          flex: 1;
-          min-width: 0;
-        }
-
-        .lyrics-popup-title {
-          font-size: 18px;
-          font-weight: 700;
-          color: var(--color-text-primary);
-          margin: 0 0 4px 0;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-        }
-
-        .lyrics-popup-artist {
-          font-size: 14px;
-          color: var(--color-text-secondary);
-          margin: 0;
-        }
-
-        .lyrics-close-button {
-          background: var(--color-bg-secondary);
-          border: 1px solid var(--color-border);
-          border-radius: 8px;
-          width: 32px;
-          height: 32px;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          cursor: pointer;
-          color: var(--color-text-primary);
-          font-size: 20px;
-          line-height: 1;
-          transition: all 0.3s ease;
-          flex-shrink: 0;
-          margin-left: 12px;
-        }
-
-        .lyrics-close-button:hover {
-          background: var(--color-bg-hover);
-          border-color: var(--color-accent);
-        }
-
-        .lyrics-content {
-          color: var(--color-text-primary);
-          font-size: 14px;
-          line-height: 1.8;
-          white-space: pre-wrap;
-          word-wrap: break-word;
-        }
-
-        .lyrics-loading {
-          display: flex;
-          flex-direction: column;
-          align-items: center;
-          justify-content: center;
-          padding: 40px 20px;
-          gap: 16px;
-        }
-
-        .lyrics-error {
-          text-align: center;
-          padding: 40px 20px;
-          color: var(--color-text-secondary);
-        }
-
-        .lyrics-error-icon {
-          font-size: 48px;
-          margin-bottom: 12px;
-        }
-
-        /* Empty State */
-        .empty-state {
-          text-align: center;
-          padding: 48px 24px;
-          animation: fadeInUp 0.5s ease;
-        }
-
-        .empty-icon {
-          font-size: 64px;
-          margin-bottom: 16px;
-          opacity: 0.5;
-          animation: pulse 2s ease infinite;
-        }
-
-        .empty-title {
-          font-size: 18px;
-          font-weight: 600;
-          color: var(--color-text-primary);
-          margin-bottom: 8px;
-        }
-
-        .empty-message {
-          font-size: 14px;
-          color: var(--color-text-secondary);
-        }
-
-        /* Toast Notifications */
-        .toast-notification {
-          position: fixed;
-          bottom: 24px;
-          left: 50%;
-          transform: translateX(-50%) translateY(100%);
-          background: var(--color-success);
-          color: white;
-          padding: 14px 20px;
-          border-radius: 12px;
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          font-weight: 600;
-          font-size: 14px;
-          z-index: 1300;
-          opacity: 0;
-          transition: all 0.3s ease;
-          max-width: calc(100vw - 48px);
-        }
-
-        .toast-notification.show {
-          transform: translateX(-50%) translateY(0);
-          opacity: 1;
-        }
-
-        .toast-notification.error {
-          background: var(--color-danger);
-        }
-
-        .toast-icon {
-          width: 24px;
-          height: 24px;
-          background: rgba(255, 255, 255, 0.2);
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-size: 14px;
-        }
-
-        /* Mobile optimizations */
-        @media (max-width: 640px) {
-          .requests-page {
-            padding: 12px;
-          }
-
-          .card {
-            padding: 16px;
-            border-radius: 16px;
-          }
-
-          . search-mode-toggle {
-            position: sticky;
-            top: 0;
-            z-index: 10;
-            backdrop-filter: blur(10px);
-            margin-bottom: 16px;
-          }
-
-          .result-card {
-            padding: 10px;
-          }
-
-          .result-number {
-            min-width: 32px;
-            height: 32px;
-            font-size: 14px;
-          }
-
-          .result-title {
-            font-size: 15px;
-          }
-
-          . result-artist {
-            font-size: 13px;
-          }
-
-          .add-button {
-            padding: 7px 14px;
-            font-size: 13px;
-            min-width: 70px;
-          }
-
-          .action-menu-button {
-            padding: 7px 14px;
-            font-size: 13px;
-            min-width: 70px;
-          }
-
-          .empty-icon {
-            font-size: 48px;
-          }
-        }
-
-        @media (max-width: 380px) {
-          .header-title {
-            font-size: 24px;
-          }
-
-          .card {
-            padding: 14px;
-          }
-
-          .mode-button {
-            font-size: 13px;
-            padding: 10px 8px;
-          }
-        }
-
-        /* Accessibility */
-        @media (prefers-reduced-motion: reduce) {
-          *, *::before, *::after {
-            animation-duration: 0. 01ms !important;
-            animation-iteration-count: 1 !important;
-            transition-duration: 0.01ms !important;
-          }
-        }
-
-        /* High contrast mode */
-        @media (prefers-contrast: high) {
-          . card {
-            border-width: 2px;
-          }
-
-          .input-field,
-          .search-input {
-            border-width: 2px;
-          }
-
-          .add-button {
-            border: 2px solid white;
-          }
-        }
-      `}</style>
 
       <div className="container">
         {/* Header */}
-        <div className="header" style={{ position: "relative" }}>
-          <h1 className="header-title">🎤 Request a Song</h1>
-          <p className="header-subtitle">
-            Find your favorite songs and rock the stage!
-          </p>
-          {/* Person icon — top-right, opens name modal */}
+        <div className="top-actions">
           <button
+            className="profile-button"
             onClick={() => {
               setNameEditOpen(!nameConfirmed);
               setNameModalOpen(true);
@@ -2726,45 +1561,21 @@ export default function Requests() {
             title={
               nameConfirmed ? `Singing as ${requestedBy}` : "Enter your name"
             }
-            style={{
-              position: "absolute",
-              top: 0,
-              right: 0,
-              background: nameConfirmed
-                ? "rgba(99,102,241,0.15)"
-                : "rgba(239,68,68,0.12)",
-              border: `1px solid ${nameConfirmed ? "rgba(99,102,241,0.35)" : "rgba(239,68,68,0.3)"}`,
-              borderRadius: 8,
-              padding: "5px 7px",
-              cursor: "pointer",
-              display: "flex",
-              flexDirection: "column",
-              alignItems: "center",
-              gap: 1,
-              lineHeight: 1,
-            }}
+            type="button"
           >
-            <span style={{ fontSize: 15 }}>👤</span>
-            {nameConfirmed ? (
-              <span
-                style={{
-                  fontSize: 9,
-                  color: "var(--color-accent)",
-                  fontWeight: 600,
-                  maxWidth: 56,
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {firstName}
-              </span>
-            ) : (
-              <span style={{ fontSize: 8, color: "#ef4444", fontWeight: 600 }}>
-                Set name
-              </span>
-            )}
+            <span>👤</span>
+            <span className="profile-name">
+              {nameConfirmed ? firstName || "Profile" : "Set name"}
+            </span>
           </button>
+        </div>
+
+        <div className="header">
+          <img className="app-icon" src="/icon.png" alt="" />
+          <h1 className="header-title">Karaoke Requests</h1>
+          <p className="header-subtitle">
+            Search the catalog, pick your version, and watch your queue.
+          </p>
         </div>
 
         {/* Name modal — portal, auto-opens if no name confirmed */}
@@ -3428,6 +2239,7 @@ export default function Requests() {
                 ).length;
                 return (
                   <div
+                    className="queue-footer request-page-gateway-theme-portal"
                     onClick={() => {
                       setMyQueueOpen((o) => !o);
                       if (!myQueueOpen) void loadMyQueue();
@@ -3555,40 +2367,45 @@ export default function Requests() {
               </div>
             ) : (
               <>
-                {/* Search / Browse row */}
-                <div
-                  style={{
-                    display: "flex",
-                    gap: 8,
-                    marginBottom: 16,
-                    flexWrap: "wrap",
-                  }}
-                >
+                <nav className="page-tabs" aria-label="Request page views">
+                  <button
+                    className={`page-tab ${localViewMode === "search" ? "active" : ""}`}
+                    onClick={() => setLocalViewMode("search")}
+                    type="button"
+                  >
+                    Search
+                  </button>
                   {localLibraryEnabled && localBrowseEnabled && (
                     <>
                       <button
-                        className={`filter-chip ${localViewMode === "search" ? "active" : ""}`}
-                        onClick={() => setLocalViewMode("search")}
-                        style={{ justifyContent: "center" }}
+                        className={`page-tab ${localViewMode === "browse" && browseCategory === "artist" ? "active" : ""}`}
+                        onClick={() => {
+                          setBrowseCategory("artist");
+                          setLocalViewMode("browse");
+                        }}
+                        type="button"
                       >
-                        <span>🔎 Search</span>
+                        Browse Artists
                       </button>
                       <button
-                        className={`filter-chip ${localViewMode === "browse" ? "active" : ""}`}
-                        onClick={() => setLocalViewMode("browse")}
-                        style={{ justifyContent: "center" }}
+                        className={`page-tab ${localViewMode === "browse" && browseCategory === "title" ? "active" : ""}`}
+                        onClick={() => {
+                          setBrowseCategory("title");
+                          setLocalViewMode("browse");
+                        }}
+                        type="button"
                       >
-                        <span>🗂️ Browse</span>
+                        Browse Songs
                       </button>
                     </>
                   )}
-                </div>
+                </nav>
 
                 {!isLocalBrowseMode && (
                   <div className="search-wrapper">
                     <input
                       className="search-input"
-                      type="search"
+                      type="text"
                       placeholder={
                         localLibraryEnabled && externalLibraryEnabled
                           ? "Search local library & Online…"
@@ -3611,7 +2428,22 @@ export default function Requests() {
                       autoCorrect="off"
                       spellCheck="false"
                     />
-                    <span className="search-icon">🔍</span>
+                    {q.trim() && (
+                      <button
+                        className="search-clear"
+                        type="button"
+                        aria-label="Clear search"
+                        title="Clear search"
+                        onClick={() => {
+                          setQ("");
+                          setLocalRows([]);
+                          setKaraokeNerdsRows([]);
+                          setFuzzySuggestions([]);
+                        }}
+                      >
+                        ×
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -3715,122 +2547,57 @@ export default function Requests() {
                 )}
 
                 {isLocalBrowseMode && (
-                  <div
-                    style={{
-                      marginBottom: 20,
-                      padding: 16,
-                      background: "var(--color-bg-secondary)",
-                      borderRadius: 14,
-                      border: "1px solid var(--color-border)",
-                      display: "flex",
-                      flexDirection: "column",
-                      gap: 16,
-                    }}
-                  >
-                    <div>
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "var(--color-text-secondary)",
-                          marginBottom: 8,
-                          textTransform: "uppercase",
-                          letterSpacing: "0.08em",
-                        }}
-                      >
-                        Browse by
-                      </div>
-                      <div style={{ display: "flex", gap: 10 }}>
-                        <button
-                          className={`filter-chip ${browseCategory === "artist" ? "active" : ""}`}
-                          onClick={() => setBrowseCategory("artist")}
-                          style={{ flex: 1, justifyContent: "center" }}
+                  <div className="browse-panel">
+                    <h2 className="section-title">
+                      {browseCategory === "artist"
+                        ? selectedBrowseArtist
+                          ? selectedBrowseArtist
+                          : "Browse by Artist"
+                        : "Browse by Song"}
+                    </h2>
+                    <select
+                      className="initial-selector browse-letter-select"
+                      aria-label="Browse letters"
+                      value={selectedBrowseLetter}
+                      onChange={(event) => {
+                        setSelectedBrowseLetter(event.currentTarget.value);
+                        setSelectedBrowseArtist("");
+                      }}
+                    >
+                      {BROWSE_LETTERS.map((letter) => (
+                        <option
+                          key={letter}
+                          value={letter}
+                          disabled={!availableBrowseLetters.has(letter)}
                         >
-                          <span>Artist</span>
-                        </button>
+                          {letter}
+                        </option>
+                      ))}
+                    </select>
+                    {selectedBrowseArtist && (
+                      <div className="browse-subheader">
                         <button
-                          className={`filter-chip ${browseCategory === "title" ? "active" : ""}`}
-                          onClick={() => setBrowseCategory("title")}
-                          style={{ flex: 1, justifyContent: "center" }}
-                        >
-                          <span>Song Title</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <div>
-                      <div
-                        style={{
-                          fontSize: 12,
-                          color: "var(--color-text-secondary)",
-                          marginBottom: 8,
-                          textTransform: "uppercase",
-                          letterSpacing: "0.08em",
-                        }}
-                      >
-                        Letter
-                      </div>
-                      <select
-                        className="form-input"
-                        value={selectedBrowseLetter}
-                        onChange={(e) =>
-                          setSelectedBrowseLetter(e.target.value)
-                        }
-                        style={{
-                          width: "100%",
-                          cursor: "pointer",
-                          background: "var(--color-bg-card)",
-                          color: "var(--color-text-primary)",
-                          border: "1px solid var(--color-border)",
-                          borderRadius: 12,
-                          padding: "12px 14px",
-                          boxSizing: "border-box",
-                        }}
-                      >
-                        <option value="">Select a letter</option>
-                        {BROWSE_LETTERS.map((letter) => (
-                          <option
-                            key={letter}
-                            value={letter}
-                            disabled={!availableBrowseLetters.has(letter)}
-                          >
-                            {letter}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-
-                    {browseCategory === "artist" && selectedBrowseLetter && (
-                      <div>
-                        <div
-                          style={{
-                            fontSize: 12,
-                            color: "var(--color-text-secondary)",
-                            marginBottom: 8,
-                            textTransform: "uppercase",
-                            letterSpacing: "0.08em",
+                          className="secondary compact"
+                          type="button"
+                          onClick={() => {
+                            setSelectedBrowseArtist("");
+                            setLocalRows([]);
+                            setBrowseSummary(
+                              `Artists starting with "${selectedBrowseLetter}"`,
+                            );
+                            requestAnimationFrame(() => {
+                              window.scrollTo({
+                                top: browseArtistScrollYRef.current,
+                                behavior: "auto",
+                              });
+                            });
                           }}
                         >
-                          Artist
-                        </div>
-                        <div
-                          style={{
-                            display: "flex",
-                            flexWrap: "wrap",
-                            gap: 8,
-                            maxHeight: 220,
-                            overflowY: "auto",
-                          }}
-                        >
-                          {browseArtists.map((artist) => (
-                            <button
-                              key={artist}
-                              className={`filter-chip ${selectedBrowseArtist === artist ? "active" : ""}`}
-                              onClick={() => setSelectedBrowseArtist(artist)}
-                            >
-                              <span>{artist}</span>
-                            </button>
-                          ))}
-                        </div>
+                          ← Artists
+                        </button>
+                        <span className="active-filter-badge">
+                          {selectedBrowseLetter}
+                        </span>
                       </div>
                     )}
                   </div>
@@ -3839,14 +2606,58 @@ export default function Requests() {
                 {/* Results */}
                 {isLocalBrowseMode ? (
                   showingBrowseArtistList ? (
-                    <div className="empty-state">
-                      <div className="empty-icon">🎙️</div>
-                      <div className="empty-title">Choose an artist</div>
-                      <div className="empty-message">
-                        Pick an artist from the list above to see songs under "
-                        {selectedBrowseLetter}".
+                    isLoading ? (
+                      <div className="loading-container">
+                        <div className="loading-spinner"></div>
+                        <div className="loading-text">Loading artists...</div>
                       </div>
-                    </div>
+                    ) : browseArtists.length > 0 ? (
+                      <div className="results-container">
+                        {browseArtists.map((artist) => {
+                          const songCount = artist.songCount ?? 0;
+                          return (
+                            <button
+                              key={artist.artist}
+                              className="result-card artist-card"
+                              type="button"
+                              onClick={() => {
+                                browseArtistScrollYRef.current =
+                                  window.scrollY ||
+                                  document.documentElement.scrollTop ||
+                                  0;
+                                setSelectedBrowseArtist(artist.artist);
+                              }}
+                            >
+                              <div className="result-info">
+                                <div className="result-title">
+                                  {artist.artist || "Unknown Artist"}
+                                </div>
+                                {artist.songCount !== undefined && (
+                                  <div className="result-artist">
+                                    {songCount}{" "}
+                                    {songCount === 1 ? "song" : "songs"}
+                                  </div>
+                                )}
+                              </div>
+                              <span
+                                className="icon-action-button"
+                                aria-hidden="true"
+                              >
+                                ›
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="empty-state">
+                        <div className="empty-icon">🎙️</div>
+                        <div className="empty-title">No artists found</div>
+                        <div className="empty-message">
+                          No artists were found under "{selectedBrowseLetter}".
+                        </div>
+                      </div>
+                    )
                   ) : isLoading ? (
                     <div className="loading-container">
                       <div className="loading-spinner"></div>
@@ -3942,7 +2753,14 @@ export default function Requests() {
                                   <button
                                     className={`action-menu-button ${isRecentlyAdded ? "success" : ""}`}
                                     onClick={(e) => {
-                                      if (!isRecentlyAdded && !isAdding) {
+                                      if (isRecentlyAdded || isAdding) return;
+                                      if (hasMultipleVersions) {
+                                        setVersionPicker({
+                                          title: group.title,
+                                          artist: group.artist,
+                                          versions: group.versions,
+                                        });
+                                      } else {
                                         handleActionMenuToggle(
                                           e,
                                           trackKey,
@@ -3958,15 +2776,11 @@ export default function Requests() {
                                         <span>Adding</span>
                                       </>
                                     ) : isRecentlyAdded ? (
-                                      <>
-                                        <span>✓</span>
-                                        <span>Added</span>
-                                      </>
+                                      <span>✓</span>
+                                    ) : hasMultipleVersions ? (
+                                      <span>☰</span>
                                     ) : (
-                                      <>
-                                        <span>⋯</span>
-                                        <span>Options</span>
-                                      </>
+                                      <span>⋯</span>
                                     )}
                                   </button>
 
@@ -3999,11 +2813,18 @@ export default function Requests() {
                                         >
                                           <div className="action-menu-header">
                                             <h3 className="action-menu-title">
-                                              {group.title || "Unknown Title"}
+                                              {group.title || "Unknown Title"}{" "}
+                                              Options
                                             </h3>
-                                            <p className="action-menu-subtitle">
-                                              {group.artist || "Unknown Artist"}
-                                            </p>
+                                            <button
+                                              className="action-menu-close"
+                                              type="button"
+                                              onClick={() =>
+                                                setActionMenuOpen(null)
+                                              }
+                                            >
+                                              Close
+                                            </button>
                                           </div>
 
                                           {keyAdjustmentView === trackKey ? (
@@ -4070,6 +2891,53 @@ export default function Requests() {
                                             </div>
                                           ) : (
                                             // Main Menu Items
+                                            <div className="action-menu-body">
+                                              <p className="action-menu-meta">
+                                                {[
+                                                  group.artist ||
+                                                    "Unknown Artist",
+                                                  row.disc_id,
+                                                  row.kind?.toUpperCase(),
+                                                ]
+                                                  .filter(Boolean)
+                                                  .join(" · ")}
+                                              </p>
+                                              {!hasMultipleVersions && (
+                                                <div className="key-controls">
+                                                  <span>
+                                                    Key:{" "}
+                                                    {currentKey > 0
+                                                      ? `+${currentKey}`
+                                                      : currentKey}
+                                                  </span>
+                                                  <button
+                                                    className="secondary compact"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      adjustKey(trackKey, -1)
+                                                    }
+                                                    disabled={
+                                                      currentKey <=
+                                                      MIN_KEY_ADJUSTMENT
+                                                    }
+                                                  >
+                                                    −
+                                                  </button>
+                                                  <button
+                                                    className="secondary compact"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      adjustKey(trackKey, 1)
+                                                    }
+                                                    disabled={
+                                                      currentKey >=
+                                                      MAX_KEY_ADJUSTMENT
+                                                    }
+                                                  >
+                                                    +
+                                                  </button>
+                                                </div>
+                                              )}
                                             <div className="action-menu-items">
                                               {/* Add to Queue - Primary action */}
                                               <button
@@ -4108,6 +2976,7 @@ export default function Requests() {
                                               {/* Adjust Key (single-version only) */}
                                               {!hasMultipleVersions && (
                                                 <button
+                                                  hidden
                                                   className="action-menu-item"
                                                   onClick={(e) => {
                                                     e.stopPropagation();
@@ -4158,7 +3027,7 @@ export default function Requests() {
                                                 }}
                                               >
                                                 <span className="action-menu-item-icon">
-                                                  📄
+                                                  ♪
                                                 </span>
                                                 <div className="action-menu-item-content">
                                                   <span className="action-menu-item-label">
@@ -4169,6 +3038,7 @@ export default function Requests() {
                                                   </span>
                                                 </div>
                                               </button>
+                                            </div>
                                             </div>
                                           )}
                                         </div>
@@ -4200,8 +3070,305 @@ export default function Requests() {
                 ) : (
                   /* Search mode — show local + KN results together */
                   <>
+                    {q.trim() &&
+                      (isLoading || isKnLoading ? (
+                        <div className="loading-container">
+                          <div className="loading-spinner"></div>
+                          <div className="loading-text">Searching...</div>
+                        </div>
+                      ) : combinedSearchGroups.length > 0 ? (
+                        <>
+                          <div className="results-header">
+                            <span className="results-count">
+                              {combinedSearchGroups.reduce(
+                                (total, group) => total + group.versions.length,
+                                0,
+                              )}{" "}
+                              result
+                              {combinedSearchGroups.reduce(
+                                (total, group) => total + group.versions.length,
+                                0,
+                              ) === 1
+                                ? ""
+                                : "s"}{" "}
+                              in {combinedSearchGroups.length} song group
+                              {combinedSearchGroups.length === 1 ? "" : "s"}
+                            </span>
+                            {kindFilter !== "all" && (
+                              <span className="active-filter-badge">
+                                {kindFilter === "mp4"
+                                  ? "🎬 MP4"
+                                  : "📀 CDG+MP3"}
+                              </span>
+                            )}
+                          </div>
+                          <div className="results-container">
+                            {combinedSearchGroups.map((group, idx) => {
+                              const firstTrack = group.versions[0];
+                              const hasMultipleVersions =
+                                group.versions.length > 1;
+                              const hasExternal = group.versions.some(
+                                (track) => track.type === "online",
+                              );
+                              const isRecentlyAdded = group.versions.some(
+                                (track) => recentlyAdded.has(track.key),
+                              );
+                              const isAdding = group.versions.some((track) =>
+                                track.type === "local"
+                                  ? addingLocal === track.track.id
+                                  : addingKaraokeNerds === track.track.url,
+                              );
+                              const trackKey = firstTrack.key;
+                              const currentKey =
+                                keyAdjustments.get(trackKey) ?? 0;
+                              const versionText =
+                                firstTrack.type === "online"
+                                  ? firstTrack.brand || "Karaoke Version"
+                                  : firstTrack.discId || "";
+                              const metaLine = [
+                                group.artist || "Unknown Artist",
+                                firstTrack.type === "online"
+                                  ? "🌐 Online"
+                                  : null,
+                                versionText,
+                              ]
+                                .filter(Boolean)
+                                .join(" · ");
+
+                              return (
+                                <div key={group.key} className="result-card">
+                                  <div className="result-number">{idx + 1}</div>
+                                  <div className="result-info">
+                                    <div className="result-title">
+                                      {group.title || "Unknown Title"}
+                                    </div>
+                                    <div className="result-artist">
+                                      {group.artist || "Unknown Artist"}
+                                    </div>
+                                    <div className="result-meta">
+                                      {hasMultipleVersions || hasExternal ? (
+                                        <span
+                                          className={`meta-tag ${hasExternal ? "brand" : ""}`}
+                                        >
+                                          {hasExternal ? "🌐 " : ""}
+                                          {group.versions.length} versions
+                                        </span>
+                                      ) : (
+                                        <>
+                                          {firstTrack.type === "local" &&
+                                            firstTrack.discId && (
+                                              <span className="meta-tag">
+                                                {firstTrack.discId}
+                                              </span>
+                                            )}
+                                          {firstTrack.type === "online" &&
+                                            firstTrack.brand && (
+                                              <span className="meta-tag brand">
+                                                {firstTrack.brand}
+                                              </span>
+                                            )}
+                                        </>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <div className="button-container">
+                                    <button
+                                      className={`action-menu-button ${firstTrack.type === "online" ? "karaoke-nerds" : ""} ${isRecentlyAdded ? "success" : ""}`}
+                                      type="button"
+                                      title={
+                                        hasMultipleVersions
+                                          ? "Choose version"
+                                          : "Options"
+                                      }
+                                      aria-label={
+                                        hasMultipleVersions
+                                          ? "Choose version"
+                                          : "Options"
+                                      }
+                                      onClick={(e) => {
+                                        if (isRecentlyAdded || isAdding) return;
+                                        if (hasMultipleVersions) {
+                                          setCombinedVersionPicker({
+                                            title: group.title,
+                                            artist: group.artist,
+                                            versions: group.versions,
+                                          });
+                                        } else {
+                                          handleActionMenuToggle(
+                                            e,
+                                            trackKey,
+                                            actionMenuOpen,
+                                          );
+                                        }
+                                      }}
+                                      disabled={isAdding || isRecentlyAdded}
+                                    >
+                                      {isAdding ? (
+                                        <div className="button-spinner"></div>
+                                      ) : isRecentlyAdded ? (
+                                        <span>✓</span>
+                                      ) : hasMultipleVersions ? (
+                                        <span>☰</span>
+                                      ) : (
+                                        <span>⋯</span>
+                                      )}
+                                    </button>
+                                    {actionMenuOpen === trackKey &&
+                                      createPortal(
+                                        <>
+                                          <div
+                                            className="action-menu-overlay"
+                                            onClick={() =>
+                                              setActionMenuOpen(null)
+                                            }
+                                          />
+                                          <div
+                                            className="action-menu"
+                                            ref={actionMenuRef}
+                                            onClick={(e) => e.stopPropagation()}
+                                          >
+                                            <div className="action-menu-header">
+                                              <h3 className="action-menu-title">
+                                                {group.title || "Unknown Title"}{" "}
+                                                Options
+                                              </h3>
+                                              <button
+                                                className="action-menu-close"
+                                                type="button"
+                                                onClick={() =>
+                                                  setActionMenuOpen(null)
+                                                }
+                                              >
+                                                Close
+                                              </button>
+                                            </div>
+                                            <div className="action-menu-body">
+                                              <p className="action-menu-meta">
+                                                {metaLine}
+                                              </p>
+                                              {firstTrack.type === "local" && (
+                                                <div className="key-controls">
+                                                  <span>
+                                                    Key:{" "}
+                                                    {currentKey > 0
+                                                      ? `+${currentKey}`
+                                                      : currentKey}
+                                                  </span>
+                                                  <button
+                                                    className="secondary compact"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      adjustKey(trackKey, -1)
+                                                    }
+                                                    disabled={
+                                                      currentKey <=
+                                                      MIN_KEY_ADJUSTMENT
+                                                    }
+                                                  >
+                                                    −
+                                                  </button>
+                                                  <button
+                                                    className="secondary compact"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      adjustKey(trackKey, 1)
+                                                    }
+                                                    disabled={
+                                                      currentKey >=
+                                                      MAX_KEY_ADJUSTMENT
+                                                    }
+                                                  >
+                                                    +
+                                                  </button>
+                                                </div>
+                                              )}
+                                              <div className="action-menu-items">
+                                                <button
+                                                  className="action-menu-item primary"
+                                                  type="button"
+                                                  onClick={() => {
+                                                    setActionMenuOpen(null);
+                                                    if (
+                                                      firstTrack.type ===
+                                                      "local"
+                                                    ) {
+                                                      void enqueueLocal(
+                                                        firstTrack.track.id,
+                                                        firstTrack.title ||
+                                                          "Unknown",
+                                                      );
+                                                    } else {
+                                                      void enqueueKaraokeNerds(
+                                                        firstTrack.track,
+                                                      );
+                                                    }
+                                                  }}
+                                                >
+                                                  <span className="action-menu-item-icon">
+                                                    +
+                                                  </span>
+                                                  <div className="action-menu-item-content">
+                                                    <span className="action-menu-item-label">
+                                                      Add to Queue
+                                                    </span>
+                                                    <span className="action-menu-item-description">
+                                                      Request this song
+                                                    </span>
+                                                  </div>
+                                                </button>
+                                                <button
+                                                  className="action-menu-item secondary"
+                                                  type="button"
+                                                  onClick={(e) => {
+                                                    e.stopPropagation();
+                                                    setActionMenuOpen(null);
+                                                    setLyricsPopupOpen(trackKey);
+                                                    if (!lyricsData[trackKey]) {
+                                                      fetchLyrics(
+                                                        trackKey,
+                                                        group.artist ||
+                                                          "Unknown Artist",
+                                                        group.title ||
+                                                          "Unknown Title",
+                                                      );
+                                                    }
+                                                  }}
+                                                >
+                                                  <span className="action-menu-item-icon">
+                                                    ♪
+                                                  </span>
+                                                  <div className="action-menu-item-content">
+                                                    <span className="action-menu-item-label">
+                                                      View Lyrics
+                                                    </span>
+                                                    <span className="action-menu-item-description">
+                                                      See song words
+                                                    </span>
+                                                  </div>
+                                                </button>
+                                              </div>
+                                            </div>
+                                          </div>
+                                        </>,
+                                        document.body,
+                                      )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </>
+                      ) : (
+                        <div className="empty-state">
+                          <div className="empty-icon">🎵</div>
+                          <div className="empty-title">
+                            No results for "{q}"
+                          </div>
+                        </div>
+                      ))}
                     {/* Local library results */}
-                    {(sourceFilter === "all" || sourceFilter === "local") &&
+                    {false &&
+                      (sourceFilter === "all" || sourceFilter === "local") &&
                       localLibraryEnabled &&
                       (isLoading ? (
                         <div className="loading-container">
@@ -4327,12 +3494,21 @@ export default function Requests() {
                                         <button
                                           className={`action-menu-button ${isRecentlyAdded ? "success" : ""}`}
                                           onClick={(e) => {
-                                            if (!isRecentlyAdded && !isAdding)
+                                            if (isRecentlyAdded || isAdding)
+                                              return;
+                                            if (hasMultipleVersions) {
+                                              setVersionPicker({
+                                                title: group.title ?? "",
+                                                artist: group.artist ?? "",
+                                                versions: group.versions,
+                                              });
+                                            } else {
                                               handleActionMenuToggle(
                                                 e,
                                                 trackKey,
                                                 actionMenuOpen,
                                               );
+                                            }
                                           }}
                                           disabled={isAdding || isRecentlyAdded}
                                         >
@@ -4342,15 +3518,11 @@ export default function Requests() {
                                               <span>Adding</span>
                                             </>
                                           ) : isRecentlyAdded ? (
-                                            <>
-                                              <span>✓</span>
-                                              <span>Added</span>
-                                            </>
+                                            <span>✓</span>
+                                          ) : hasMultipleVersions ? (
+                                            <span>☰</span>
                                           ) : (
-                                            <>
-                                              <span>⋯</span>
-                                              <span>Options</span>
-                                            </>
+                                            <span>⋯</span>
                                           )}
                                         </button>
                                         {actionMenuOpen === trackKey &&
@@ -4382,13 +3554,66 @@ export default function Requests() {
                                                 <div className="action-menu-header">
                                                   <h3 className="action-menu-title">
                                                     {group.title ||
-                                                      "Unknown Title"}
+                                                      "Unknown Title"}{" "}
+                                                    Options
                                                   </h3>
-                                                  <p className="action-menu-subtitle">
-                                                    {group.artist ||
-                                                      "Unknown Artist"}
-                                                  </p>
+                                                  <button
+                                                    className="action-menu-close"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      setActionMenuOpen(null)
+                                                    }
+                                                  >
+                                                    Close
+                                                  </button>
                                                 </div>
+                                                <div className="action-menu-body">
+                                                  <p className="action-menu-meta">
+                                                    {[
+                                                      group.artist ||
+                                                        "Unknown Artist",
+                                                      row.disc_id,
+                                                      row.kind?.toUpperCase(),
+                                                    ]
+                                                      .filter(Boolean)
+                                                      .join(" · ")}
+                                                  </p>
+                                                  {!hasMultipleVersions && (
+                                                    <div className="key-controls">
+                                                      <span>
+                                                        Key:{" "}
+                                                        {currentKey > 0
+                                                          ? `+${currentKey}`
+                                                          : currentKey}
+                                                      </span>
+                                                      <button
+                                                        className="secondary compact"
+                                                        type="button"
+                                                        onClick={() =>
+                                                          adjustKey(trackKey, -1)
+                                                        }
+                                                        disabled={
+                                                          currentKey <=
+                                                          MIN_KEY_ADJUSTMENT
+                                                        }
+                                                      >
+                                                        −
+                                                      </button>
+                                                      <button
+                                                        className="secondary compact"
+                                                        type="button"
+                                                        onClick={() =>
+                                                          adjustKey(trackKey, 1)
+                                                        }
+                                                        disabled={
+                                                          currentKey >=
+                                                          MAX_KEY_ADJUSTMENT
+                                                        }
+                                                      >
+                                                        +
+                                                      </button>
+                                                    </div>
+                                                  )}
                                                 <div className="action-menu-items">
                                                   <button
                                                     className="action-menu-item primary"
@@ -4425,23 +3650,6 @@ export default function Requests() {
                                                       </span>
                                                     </div>
                                                   </button>
-                                                  {currentKey !== 0 && (
-                                                    <div className="key-adjustment-header">
-                                                      <span
-                                                        style={{
-                                                          fontSize: 11,
-                                                          color:
-                                                            "var(--color-text-secondary)",
-                                                        }}
-                                                      >
-                                                        Key:{" "}
-                                                        {currentKey > 0
-                                                          ? "+"
-                                                          : ""}
-                                                        {currentKey}
-                                                      </span>
-                                                    </div>
-                                                  )}
                                                   <button
                                                     className="action-menu-item"
                                                     onClick={(e) => {
@@ -4463,7 +3671,7 @@ export default function Requests() {
                                                     }}
                                                   >
                                                     <span className="action-menu-item-icon">
-                                                      📄
+                                                      ♪
                                                     </span>
                                                     <div className="action-menu-item-content">
                                                       <span className="action-menu-item-label">
@@ -4474,6 +3682,7 @@ export default function Requests() {
                                                       </span>
                                                     </div>
                                                   </button>
+                                                </div>
                                                 </div>
                                               </div>
                                             </>,
@@ -4595,7 +3804,8 @@ export default function Requests() {
                       ) : null)}
 
                     {/* Karaoke Nerds results */}
-                    {(sourceFilter === "all" || sourceFilter === "online") &&
+                    {false &&
+                      (sourceFilter === "all" || sourceFilter === "online") &&
                       externalLibraryEnabled &&
                       (isKnLoading ? (
                         <div className="loading-container">
@@ -4697,12 +3907,21 @@ export default function Requests() {
                                         <button
                                           className={`action-menu-button karaoke-nerds ${isRecentlyAdded ? "success" : ""}`}
                                           onClick={(e) => {
-                                            if (!isRecentlyAdded && !isAdding)
+                                            if (isRecentlyAdded || isAdding)
+                                              return;
+                                            if (hasMultipleVersions) {
+                                              setKnVersionPicker({
+                                                title: group.title,
+                                                artist: group.artist,
+                                                versions: group.versions,
+                                              });
+                                            } else {
                                               handleActionMenuToggle(
                                                 e,
                                                 trackKey,
                                                 actionMenuOpen,
                                               );
+                                            }
                                           }}
                                           disabled={isAdding || isRecentlyAdded}
                                         >
@@ -4712,15 +3931,11 @@ export default function Requests() {
                                               <span>Adding</span>
                                             </>
                                           ) : isRecentlyAdded ? (
-                                            <>
-                                              <span>✓</span>
-                                              <span>Added</span>
-                                            </>
+                                            <span>✓</span>
+                                          ) : hasMultipleVersions ? (
+                                            <span>☰</span>
                                           ) : (
-                                            <>
-                                              <span>⋯</span>
-                                              <span>Options</span>
-                                            </>
+                                            <span>⋯</span>
                                           )}
                                         </button>
                                         {actionMenuOpen === trackKey &&
@@ -4751,13 +3966,30 @@ export default function Requests() {
                                               >
                                                 <div className="action-menu-header">
                                                   <h3 className="action-menu-title">
-                                                    {group.title}
+                                                    {group.title} Options
                                                   </h3>
-                                                  <p className="action-menu-subtitle">
-                                                    {group.artist ||
-                                                      "Unknown Artist"}
-                                                  </p>
+                                                  <button
+                                                    className="action-menu-close"
+                                                    type="button"
+                                                    onClick={() =>
+                                                      setActionMenuOpen(null)
+                                                    }
+                                                  >
+                                                    Close
+                                                  </button>
                                                 </div>
+                                                <div className="action-menu-body">
+                                                  <p className="action-menu-meta">
+                                                    {[
+                                                      group.artist ||
+                                                        "Unknown Artist",
+                                                      "🌐 Online",
+                                                      firstTrack.brand ||
+                                                        "Karaoke Version",
+                                                    ]
+                                                      .filter(Boolean)
+                                                      .join(" · ")}
+                                                  </p>
                                                 <div className="action-menu-items">
                                                   <button
                                                     className="action-menu-item primary"
@@ -4812,7 +4044,7 @@ export default function Requests() {
                                                     }}
                                                   >
                                                     <span className="action-menu-item-icon">
-                                                      📄
+                                                      ♪
                                                     </span>
                                                     <div className="action-menu-item-content">
                                                       <span className="action-menu-item-label">
@@ -4823,6 +4055,7 @@ export default function Requests() {
                                                       </span>
                                                     </div>
                                                   </button>
+                                                </div>
                                                 </div>
                                               </div>
                                             </>,
@@ -4873,6 +4106,94 @@ export default function Requests() {
           </div>
         )}
       </div>
+
+      {/* Combined Version Picker Modal */}
+      {combinedVersionPicker && (
+        <>
+          <div
+            className="action-menu-overlay"
+            onClick={() => setCombinedVersionPicker(null)}
+          />
+          <div className="action-menu version-dialog">
+            <div className="action-menu-header">
+              <h3 className="action-menu-title">
+                {combinedVersionPicker.title || "Choose a version"}
+              </h3>
+              <div className="dialog-actions">
+                <button
+                  className="icon-action-button secondary"
+                  type="button"
+                  aria-label="View lyrics"
+                  title="View lyrics"
+                  onClick={() => {
+                    const firstVersion = combinedVersionPicker.versions[0];
+                    if (!firstVersion) return;
+                    setCombinedVersionPicker(null);
+                    setLyricsPopupOpen(firstVersion.key);
+                    if (!lyricsData[firstVersion.key]) {
+                      fetchLyrics(
+                        firstVersion.key,
+                        combinedVersionPicker.artist || "Unknown Artist",
+                        combinedVersionPicker.title || "Unknown Title",
+                      );
+                    }
+                  }}
+                >
+                  ♪
+                </button>
+                <button
+                  className="action-menu-close"
+                  type="button"
+                  onClick={() => setCombinedVersionPicker(null)}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="version-list">
+              {combinedVersionPicker.versions.map((version) => {
+                const isLocal = version.type === "local";
+                const label = isLocal
+                  ? version.discId || "Version"
+                  : version.brand || "Karaoke Version";
+                const meta = [
+                  !isLocal ? "🌐 Online" : null,
+                  isLocal ? version.kind?.toUpperCase() : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return (
+                  <article key={version.key} className="version-row">
+                    <div>
+                      <strong>{label}</strong>
+                      {meta && <span>{meta}</span>}
+                    </div>
+                    <button
+                      className="icon-action-button"
+                      type="button"
+                      aria-label="Add version"
+                      title="Add version"
+                      onClick={() => {
+                        setCombinedVersionPicker(null);
+                        if (version.type === "local") {
+                          void enqueueLocal(
+                            version.track.id,
+                            version.title || "Unknown",
+                          );
+                        } else {
+                          void enqueueKaraokeNerds(version.track);
+                        }
+                      }}
+                    >
+                      +
+                    </button>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
 
       {/* Version Picker Modal */}
       {versionPicker && (
@@ -4926,19 +4247,37 @@ export default function Requests() {
                   {versionPicker.artist} — Pick a version
                 </div>
               </div>
-              <button
-                onClick={() => setVersionPicker(null)}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "var(--color-text-secondary)",
-                  fontSize: 20,
-                  cursor: "pointer",
-                  padding: 4,
-                }}
-              >
-                ✕
-              </button>
+              <div className="dialog-actions">
+                <button
+                  className="icon-action-button secondary"
+                  type="button"
+                  aria-label="View lyrics"
+                  title="View lyrics"
+                  onClick={() => {
+                    const firstVersion = versionPicker.versions[0];
+                    if (!firstVersion) return;
+                    const trackKey = `local-${firstVersion.id}`;
+                    setVersionPicker(null);
+                    setLyricsPopupOpen(trackKey);
+                    if (!lyricsData[trackKey]) {
+                      fetchLyrics(
+                        trackKey,
+                        versionPicker.artist || "Unknown Artist",
+                        versionPicker.title || "Unknown Title",
+                      );
+                    }
+                  }}
+                >
+                  ♪
+                </button>
+                <button
+                  className="action-menu-close"
+                  type="button"
+                  onClick={() => setVersionPicker(null)}
+                >
+                  Close
+                </button>
+              </div>
             </div>
             <div
               style={{
@@ -5064,19 +4403,37 @@ export default function Requests() {
                   {knVersionPicker.artist} — Pick a version
                 </div>
               </div>
-              <button
-                onClick={() => setKnVersionPicker(null)}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "var(--color-text-secondary)",
-                  fontSize: 20,
-                  cursor: "pointer",
-                  padding: 4,
-                }}
-              >
-                ✕
-              </button>
+              <div className="dialog-actions">
+                <button
+                  className="icon-action-button secondary"
+                  type="button"
+                  aria-label="View lyrics"
+                  title="View lyrics"
+                  onClick={() => {
+                    const firstVersion = knVersionPicker.versions[0];
+                    if (!firstVersion) return;
+                    const trackKey = `kn-${firstVersion.url}`;
+                    setKnVersionPicker(null);
+                    setLyricsPopupOpen(trackKey);
+                    if (!lyricsData[trackKey]) {
+                      fetchLyrics(
+                        trackKey,
+                        knVersionPicker.artist || "Unknown Artist",
+                        knVersionPicker.title || "Unknown Title",
+                      );
+                    }
+                  }}
+                >
+                  ♪
+                </button>
+                <button
+                  className="action-menu-close"
+                  type="button"
+                  onClick={() => setKnVersionPicker(null)}
+                >
+                  Close
+                </button>
+              </div>
             </div>
             <div
               style={{
@@ -5154,21 +4511,18 @@ export default function Requests() {
       {lyricsPopupOpen &&
         (() => {
           // Find the track data for the popup
-          let artist = "Unknown Artist";
           let title = "Unknown Title";
 
           if (lyricsPopupOpen.startsWith("local-")) {
             const trackId = parseInt(lyricsPopupOpen.replace("local-", ""));
             const track = localRows.find((r) => r.id === trackId);
             if (track) {
-              artist = track.artist || "Unknown Artist";
               title = track.title || "Unknown Title";
             }
           } else if (lyricsPopupOpen.startsWith("kn-")) {
             const trackUrl = lyricsPopupOpen.replace("kn-", "");
             const track = karaokeNerdsRows.find((t) => t.url === trackUrl);
             if (track) {
-              artist = track.artist || "Unknown Artist";
               title = track.title;
             }
           }
@@ -5186,31 +4540,22 @@ export default function Requests() {
                 onClick={(e) => e.stopPropagation()}
               >
                 <div className="lyrics-header">
-                  <div className="lyrics-title-info">
-                    <h2 className="lyrics-popup-title">{title}</h2>
-                    <p className="lyrics-popup-artist">{artist}</p>
-                  </div>
+                  <h2 className="lyrics-popup-title">{title} Lyrics</h2>
                   <button
-                    className="lyrics-close-button"
+                    className="action-menu-close"
+                    type="button"
                     onClick={() => setLyricsPopupOpen(null)}
-                    aria-label="Close"
                   >
-                    ×
+                    Close
                   </button>
                 </div>
 
                 {data?.loading ? (
-                  <div className="lyrics-loading">
-                    <div className="loading-spinner"></div>
-                    <div className="loading-text">Loading lyrics...</div>
-                  </div>
+                  <pre className="lyrics-content">Loading...</pre>
                 ) : data?.error ? (
-                  <div className="lyrics-error">
-                    <div className="lyrics-error-icon">😔</div>
-                    <div>{data.error}</div>
-                  </div>
+                  <pre className="lyrics-content">{data.error}</pre>
                 ) : data?.lyrics ? (
-                  <div className="lyrics-content">{data.lyrics}</div>
+                  <pre className="lyrics-content">{data.lyrics}</pre>
                 ) : null}
               </div>
             </div>

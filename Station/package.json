@@ -1,0 +1,80 @@
+{
+  "name": "karaokedock-station",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop Station wrapper for running KaraokeDock locally.",
+  "desktopName": "KaraokeDock Station",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:web": "cd ../src/web && npm exec -- tsc --noEmit && npm exec -- vite build --outDir ../../Station/.build/web-dist --emptyOutDir",
+    "build:station": "npm run build:web && npm run build",
+    "stage:postgres": "bash scripts/stage-postgres.sh",
+    "stage:ffmpeg": "bash scripts/stage-ffmpeg.sh",
+    "stage:runtimes": "npm run stage:postgres && npm run stage:ffmpeg",
+    "dev": "npm run build:station && electron .",
+    "dist:appimage": "npm run stage:runtimes && npm run build:station && electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "electron": "^43.1.1",
+    "electron-builder": "^26.15.3",
+    "typescript": "^6.0.3"
+  },
+  "build": {
+    "appId": "io.github.haggardj2.karaokedock.station",
+    "productName": "KaraokeDock Station",
+  "icon": "../docs/images/icon.png",
+  "artifactName": "KaraokeDock-Station-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".build/postgres",
+        "to": "postgres"
+      },
+      {
+        "from": ".build/ffmpeg",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "../src/server",
+        "to": "server",
+        "filter": [
+          "**/*",
+          "!coverage/**",
+          "!node_modules/.cache/**"
+        ]
+      },
+      {
+        "from": "../src/server/node_modules",
+        "to": "server/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": ".build/web-dist",
+        "to": "web-dist"
+      },
+      {
+        "from": "../docs/images/icon.png",
+        "to": "icons/icon.png"
+      }
+    ],
+    "linux": {
+      "syncDesktopName": true,
+      "synopsis": "Self-contained KaraokeDock Station",
+      "description": "Run KaraokeDock locally with a managed desktop shell and player window.",
+      "target": [
+        "AppImage"
+      ],
+      "category": "AudioVideo"
+    }
+  }
+}

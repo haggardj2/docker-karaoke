@@ -27,6 +27,7 @@ export interface QueueSong {
 
 export interface QueueSinger {
   singerId: string; // bigint serialised as string
+  publicUuid?: string | null;
   displayName: string;
   status: string;
   rotationPosition: number | null;
@@ -172,7 +173,7 @@ export async function getQueueState(): Promise<QueueState> {
   let singerRows: any[] = [];
   if (singerIds.length > 0) {
     const sRes = await query<any>(
-      `SELECT s.id, s.display_name, s.normalized_name, s.status,
+      `SELECT s.id, s.public_uuid, s.display_name, s.normalized_name, s.status,
               s.last_sang_at, s.total_songs_sung,
               rs.position AS rotation_position
          FROM singers s
@@ -218,6 +219,7 @@ export async function getQueueState(): Promise<QueueState> {
 
     queueOrder.push({
       singerId: sid,
+      publicUuid: sRow.public_uuid ?? null,
       displayName: sRow.display_name,
       status: sRow.status,
       rotationPosition: sRow.rotation_position != null ? Number(sRow.rotation_position) : null,

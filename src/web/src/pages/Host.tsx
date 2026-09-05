@@ -38,6 +38,7 @@ type QueueSong = {
 
 type QueueSinger = {
   singerId: string
+  publicUuid?: string | null
   displayName: string
   status: string
   rotationPosition: number | null
@@ -410,8 +411,13 @@ export default function Host() {
     const seen = new Set<string>()
 
     return (queueState?.queueOrder ?? [])
-      .map((singer) => singer.displayName.trim())
-      .filter((name) => {
+      .map((singer) => ({
+        singerId: singer.singerId,
+        publicUuid: singer.publicUuid ?? null,
+        displayName: singer.displayName.trim(),
+      }))
+      .filter((singer) => {
+        const name = singer.displayName
         if (!name) return false
         const normalizedName = name.toLocaleLowerCase()
         if (seen.has(normalizedName)) return false
@@ -419,10 +425,10 @@ export default function Host() {
         return !normalizedQuery || normalizedName.includes(normalizedQuery)
       })
       .sort((a, b) => {
-        const aStarts = a.toLocaleLowerCase().startsWith(normalizedQuery)
-        const bStarts = b.toLocaleLowerCase().startsWith(normalizedQuery)
+        const aStarts = a.displayName.toLocaleLowerCase().startsWith(normalizedQuery)
+        const bStarts = b.displayName.toLocaleLowerCase().startsWith(normalizedQuery)
         if (aStarts !== bStarts) return aStarts ? -1 : 1
-        return a.localeCompare(b)
+        return a.displayName.localeCompare(b.displayName)
       })
       .slice(0, 8)
   }, [manualRequestName, queueState])
@@ -1480,7 +1486,9 @@ export default function Host() {
     if (!sourceName) { setMergeSingerError('Enter a singer name to merge'); return }
     // Find singer id by name
     const allSingers = queueState?.queueOrder ?? []
-    const matchedSinger = allSingers.find(s => s.displayName.toLowerCase() === sourceName.toLowerCase())
+    const matchedSinger =
+      allSingers.find(s => s.displayName.toLowerCase() === sourceName.toLowerCase() && s.singerId !== selectedSingerId) ??
+      allSingers.find(s => s.displayName.toLowerCase() === sourceName.toLowerCase())
     if (!matchedSinger) { setMergeSingerError(`Singer "${sourceName}" not found`); return }
     if (matchedSinger.singerId === selectedSingerId) { setMergeSingerError('Cannot merge a singer with themselves'); return }
     setMergingSinger(true)
@@ -2066,7 +2074,7 @@ export default function Host() {
     }
   }
 
-  async function replaceSongWithKaraokeNerds(queueId: number, track: { title: string; artist: string; url: string }) {
+  async function replaceSongWithKaraokeNerds(queueId: number, track: { title: string; artist: string; url: string; brand?: string }) {
     if (! auth.sessionToken || !auth.isLoggedIn) return
 
     setBusy(true)
@@ -2081,6 +2089,7 @@ export default function Host() {
             artist: track.artist,
             url: track.url,
             source: 'karaoke-nerds',
+            brand: track.brand || null,
           },
         })
       })
@@ -2156,10 +2165,25 @@ export default function Host() {
     setManualRequestForSingerId(null)
   }
 
-  function selectManualRequestSinger(name: string) {
-    setManualRequestName(name)
+  function selectManualRequestSinger(singer: { displayName: string }) {
+    setManualRequestName(singer.displayName)
     setShowManualSingerSuggestions(false)
     setManualSingerHighlightIndex(0)
+  }
+
+  function getManualRequestSingerUuid(): string | null {
+    const normalizedName = manualRequestName.trim().toLocaleLowerCase()
+    if (!normalizedName) return null
+
+    const selectedById = manualRequestForSingerId
+      ? (queueState?.queueOrder ?? []).find((singer) => singer.singerId === manualRequestForSingerId)
+      : null
+    if (selectedById?.publicUuid) return selectedById.publicUuid
+
+    const selectedByName = (queueState?.queueOrder ?? []).find(
+      (singer) => singer.displayName.trim().toLocaleLowerCase() === normalizedName && singer.publicUuid,
+    )
+    return selectedByName?.publicUuid ?? null
   }
 
   // Add manual request to queue - Local track
@@ -2173,7 +2197,8 @@ export default function Host() {
         headers,
         body: JSON.stringify({
           trackId,
-          requestedBy: manualRequestName || null
+          requestedBy: manualRequestName || null,
+          singerUuid: getManualRequestSingerUuid(),
         })
       })
 
@@ -2185,7 +2210,7 @@ export default function Host() {
   }
 
   // Add manual request to queue - External (Karaoke Nerds) track
-  async function addManualRequestExternal(track: { title: string; artist: string; url: string }) {
+  async function addManualRequestExternal(track: { title: string; artist: string; url: string; brand?: string }) {
     if (!auth.sessionToken || !auth.isLoggedIn) return
 
     setBusy(true)
@@ -2197,7 +2222,9 @@ export default function Host() {
           title: track.title,
           artist: track.artist,
           url: track.url,
-          requestedBy: manualRequestName || null
+          brand: track.brand || null,
+          requestedBy: manualRequestName || null,
+          singerUuid: getManualRequestSingerUuid(),
         })
       })
 
@@ -2261,7 +2288,9 @@ export default function Host() {
           title: manualRequestTitle || 'Video',
           artist: manualRequestArtist || 'Unknown',
           url: manualRequestUrl,
-          requestedBy: manualRequestName || null
+          requestedBy: manualRequestName || null,
+          discId: manualRequestDiscId || null,
+          singerUuid: getManualRequestSingerUuid(),
         })
       })
 
@@ -6297,17 +6326,17 @@ function closeDetails(e: React.SyntheticEvent) {
                     />
                     {showManualSingerSuggestions && manualSingerSuggestions.length > 0 && (
                       <div className="manual-singer-suggestions">
-                        {manualSingerSuggestions.map((name, index) => (
+                        {manualSingerSuggestions.map((singer, index) => (
                           <button
-                            key={name}
+                            key={singer.publicUuid || singer.singerId || singer.displayName}
                             type="button"
                             className={`manual-singer-suggestion${index === manualSingerHighlightIndex ? ' active' : ''}`}
                             onMouseDown={(e) => {
                               e.preventDefault()
-                              selectManualRequestSinger(name)
+                              selectManualRequestSinger(singer)
                             }}
                           >
-                            <span>{name}</span>
+                            <span>{singer.displayName}</span>
                             <span className="manual-singer-suggestion-hint">Use existing singer</span>
                           </button>
                         ))}

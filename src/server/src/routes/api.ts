@@ -49,8 +49,9 @@ import {
   syncDownloadScanTaskState,
   syncBreakMusicScanTaskState,
 } from '../backgroundTasks';
-import { findOrCreateSinger, ensureSingerInActiveRotation, normalizeSingerName, normalizeSingerUuid } from '../queueIdentity.js';
+import { findOrCreateSinger, ensureSingerInActiveRotation, normalizeSingerName, normalizeSingerUuid, type SingerRow } from '../queueIdentity.js';
 import { parseZipMediaRef } from '../zipMediaRef.js';
+import { buildOidcGrantCallbackUrl } from '../oidcRedirect.js';
 import {
   getQueueState,
   getSingerHistory,
@@ -91,7 +92,7 @@ interface PublicSettings {
   'requests.url': string;
 }
 
-const DEFAULT_BREAK_PLAYLISTS_FOLDER = '/media/playlists';
+const DEFAULT_BREAK_PLAYLISTS_FOLDER = process.env.BREAK_MUSIC_PLAYLISTS_FOLDER || '/media/playlists';
 
 let postQueueUpdate: (type?: string, data?: any) => void = () => {};
 export function setPostQueueUpdate(fn: (type?: string, data?: any) => void) {
@@ -107,6 +108,15 @@ const getAuthenticatedUser = async (req: express.Request): Promise<User | null> 
   const userId = Number((req as any).user?.userId);
   if (!Number.isFinite(userId) || userId <= 0) return null;
   return getUserById(userId);
+};
+
+const getOptionalAuthenticatedUser = async (req: express.Request): Promise<User | null> => {
+  const token = req.headers['x-session-token'];
+  if (typeof token !== 'string' || !token.trim()) return null;
+
+  const info = await validateSessionInfo(token);
+  if (!info.valid || !info.userId) return null;
+  return getUserById(info.userId);
 };
 
 // Session-based authentication guard (validates session, attaches user info)
@@ -201,8 +211,527 @@ type SingerHistoryKdFile = {
   singers: SingerHistoryKdSinger[];
 };
 
+type RemoteGatewayConfig = {
+  url: string;
+  token: string;
+};
+
+type RemoteGatewayPendingRequest = {
+  id: string;
+  trackId: string | number;
+  requestedBy: string;
+  singerUuid?: string | null;
+  keyAdjustment?: number | null;
+  notes?: string | null;
+  title?: string | null;
+  artist?: string | null;
+  discId?: string | null;
+  brand?: string | null;
+  externalUrl?: string | null;
+  source?: string | null;
+};
+
+type RemoteGatewayQueueAction = {
+  id: string;
+  type: 'reorder' | 'remove';
+  requestedBy?: string | null;
+  singerUuid?: string | null;
+  payload?: {
+    queueIds?: Array<string | number>;
+    queueId?: string | number;
+  };
+};
+
+const DEFAULT_REMOTE_GATEWAY_POLL_SECONDS = 5;
+const MIN_REMOTE_GATEWAY_POLL_SECONDS = 2;
+const REMOTE_GATEWAY_CATALOG_REFRESH_MS = 10 * 60_000;
+const REMOTE_GATEWAY_CATALOG_CHUNK_SIZE = 500;
+let remoteGatewayTimer: ReturnType<typeof setTimeout> | null = null;
+let remoteGatewayInFlight: Promise<void> | null = null;
+let remoteGatewayLastCatalogSync = 0;
+
 function toSafeFilename(value: string): string {
   return value.trim().replace(/[^a-z0-9_-]+/gi, '-').replace(/^-+|-+$/g, '') || 'singer-history';
+}
+
+function normalizeRemoteGatewayBaseUrl(value: unknown): string {
+  return String(value ?? '').trim().replace(/\/+$/, '');
+}
+
+async function getRemoteGatewayConfig(): Promise<RemoteGatewayConfig> {
+  const enabled = await getSetting('remote_gateway.enabled');
+  const url = normalizeRemoteGatewayBaseUrl(await getSetting('remote_gateway.url'));
+  const token = String(await getSetting('remote_gateway.api_token') ?? '').trim();
+  if (enabled !== true) {
+    throw Object.assign(new Error('Remote Requests Gateway is not enabled'), { status: 400 });
+  }
+  if (!url) {
+    throw Object.assign(new Error('Remote Requests Gateway URL is not configured'), { status: 400 });
+  }
+  if (!token) {
+    throw Object.assign(new Error('Remote Requests Gateway API token is not configured'), { status: 400 });
+  }
+  return { url, token };
+}
+
+async function callRemoteGateway(config: RemoteGatewayConfig, pathName: string, init: RequestInit = {}) {
+  const response = await fetch(`${config.url}${pathName}`, {
+    ...init,
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${config.token}`,
+      ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(init.headers || {}),
+    },
+  });
+  const text = await response.text();
+  let body: any = null;
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = text;
+    }
+  }
+  if (!response.ok) {
+    const message = typeof body === 'object' && body?.error ? body.error : text || response.statusText;
+    throw Object.assign(new Error(`Gateway ${response.status}: ${message}`), { status: response.status });
+  }
+  return body;
+}
+
+async function getRemoteGatewayStatus(config: RemoteGatewayConfig) {
+  return callRemoteGateway(config, '/api/station/status');
+}
+
+async function getRemoteGatewaySettingsPayload() {
+  return {
+    'libraries.local_enabled': await getSetting('libraries.local_enabled') !== false,
+    'libraries.external_enabled': await getSetting('libraries.external_enabled') !== false,
+    'requests.acceptance': await getSetting('requests.acceptance') || 'local',
+    'requests.local_browse_enabled': await getSetting('requests.local_browse_enabled') !== false,
+  };
+}
+
+async function pushRemoteGatewaySettings(config: RemoteGatewayConfig) {
+  return callRemoteGateway(config, '/api/station/settings', {
+    method: 'PUT',
+    body: JSON.stringify({ settings: await getRemoteGatewaySettingsPayload() }),
+  });
+}
+
+async function pushRemoteGatewayCatalog(config: RemoteGatewayConfig) {
+  const tracks = await query<{
+    id: number;
+    title: string;
+    artist: string | null;
+    disc_id: string | null;
+    kind: string;
+    duration_ms: number | null;
+    source: string | null;
+    external_url: string | null;
+  }>(
+    `SELECT t.id,
+            t.title,
+            a.name AS artist,
+            t.disc_id,
+            t.kind,
+            t.duration_ms,
+            COALESCE(t.source, 'local') AS source,
+            t.external_url
+       FROM tracks t
+       LEFT JOIN artists a ON a.id = t.artist_id
+      WHERE COALESCE(t.title, '') <> ''
+      ORDER BY t.id`,
+  );
+
+  const syncId = `station-${Date.now()}-${crypto.randomUUID()}`;
+  const chunkCount = Math.max(1, Math.ceil(tracks.rows.length / REMOTE_GATEWAY_CATALOG_CHUNK_SIZE));
+  let accepted = 0;
+  let received = 0;
+  let response: any = null;
+
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
+    const chunkRows = tracks.rows.slice(
+      chunkIndex * REMOTE_GATEWAY_CATALOG_CHUNK_SIZE,
+      (chunkIndex + 1) * REMOTE_GATEWAY_CATALOG_CHUNK_SIZE,
+    );
+    response = await callRemoteGateway(config, '/api/station/catalog', {
+      method: 'PUT',
+      body: JSON.stringify({
+        full: true,
+        syncId,
+        chunkIndex,
+        chunkCount,
+        complete: chunkIndex === chunkCount - 1,
+        tracks: chunkRows.map((track) => ({
+          id: track.id,
+          title: track.title,
+          artist: track.artist,
+          discId: track.disc_id,
+          kind: track.kind,
+          durationMs: track.duration_ms,
+          source: track.source || 'local',
+          externalUrl: track.external_url,
+        })),
+      }),
+    });
+    accepted += Number(response?.accepted || 0);
+    received += Number(response?.received || chunkRows.length);
+  }
+
+  return {
+    ...(response || { ok: true }),
+    received,
+    accepted,
+    chunks: chunkCount,
+    syncId,
+    stationTracks: tracks.rows.length,
+  };
+}
+
+async function pushRemoteGatewayQueueSnapshot(config: RemoteGatewayConfig) {
+  const queue = await query<{
+    id: string;
+    track_id: string;
+    requested_by: string | null;
+    singer_uuid: string | null;
+    status: string;
+    position: number;
+    key_adjustment: number | null;
+    title: string;
+    artist: string | null;
+  }>(
+    `SELECT q.id,
+            q.track_id,
+            q.requested_by,
+            s.public_uuid AS singer_uuid,
+            q.status,
+            q.position,
+            q.key_adjustment,
+            t.title,
+            a.name AS artist
+       FROM queue q
+       JOIN tracks t ON t.id = q.track_id
+       LEFT JOIN artists a ON a.id = t.artist_id
+       LEFT JOIN singers s ON s.id = q.singer_id
+      WHERE q.status <> 'removed'
+      ORDER BY q.position, q.created_at`,
+  );
+
+  const response = await callRemoteGateway(config, '/api/station/queue/snapshot', {
+    method: 'PUT',
+    body: JSON.stringify({
+      full: true,
+      queue: queue.rows.map((item) => ({
+        stationQueueId: item.id,
+        stationTrackId: item.track_id,
+        requestedBy: item.requested_by,
+        singerUuid: item.singer_uuid,
+        status: item.status,
+        position: item.position,
+        keyAdjustment: item.key_adjustment ?? 0,
+        title: item.title,
+        artist: item.artist,
+      })),
+    }),
+  });
+
+  return {
+    ...response,
+    stationQueueItems: queue.rows.length,
+  };
+}
+
+async function queueRemoteGatewayRequest(request: RemoteGatewayPendingRequest): Promise<{ status: 'queued' | 'rejected'; stationQueueId?: string; error?: string }> {
+  const requestedBy = String(request.requestedBy ?? '').trim();
+  if (!requestedBy) {
+    return { status: 'rejected', error: 'requestedBy is required' };
+  }
+
+  const keyAdjustment = toInt(request.keyAdjustment) ?? 0;
+  if (!validateKeyAdjustment(keyAdjustment)) {
+    return { status: 'rejected', error: 'keyAdjustment must be between -6 and 6' };
+  }
+
+  let trackId = Number(request.trackId);
+  let trackInfo = Number.isFinite(trackId)
+    ? await query<{ id: number; source: string | null }>('SELECT id, source FROM tracks WHERE id = $1 LIMIT 1', [trackId])
+    : { rows: [] as { id: number; source: string | null }[] };
+
+  if (trackInfo.rows.length === 0 && request.externalUrl) {
+    const title = String(request.title || request.externalUrl).trim();
+    const { upsertArtist, upsertExternalTrack } = await import('../db');
+    const artistId = request.artist ? await upsertArtist(request.artist) : null;
+    const track = await upsertExternalTrack({
+      artist_id: artistId,
+      disc_id: request.discId || request.brand || null,
+      title,
+      external_url: request.externalUrl,
+      source: request.source || 'karaoke-nerds',
+      duration_ms: null,
+    });
+    trackId = Number(track.id);
+    trackInfo = await query<{ id: number; source: string | null }>('SELECT id, source FROM tracks WHERE id = $1 LIMIT 1', [trackId]);
+  }
+
+  if (!Number.isFinite(trackId) || trackInfo.rows.length === 0) {
+    return { status: 'rejected', error: 'Track not found on Station' };
+  }
+
+  const isExternal = trackInfo.rows[0].source && trackInfo.rows[0].source !== 'local';
+  if (isExternal && await getSetting('libraries.external_enabled') === false) {
+    return { status: 'rejected', error: 'External library is disabled' };
+  }
+  if (!isExternal && await getSetting('libraries.local_enabled') === false) {
+    return { status: 'rejected', error: 'Local library is disabled' };
+  }
+
+  let singerId: bigint | null = null;
+  try {
+    const singer = await findOrCreateSinger(requestedBy, normalizeSingerUuid(request.singerUuid));
+    singerId = singer.id;
+    await ensureSingerInActiveRotation(singerId);
+  } catch (err) {
+    console.error('Remote Gateway singer creation failed:', err);
+  }
+
+  if (singerId) {
+    const dupCheck = await query<{ id: string }>(
+      `SELECT id FROM queue WHERE singer_id = $1 AND track_id = $2 AND status IN ('queued', 'playing') LIMIT 1`,
+      [singerId, trackId],
+    );
+    if (dupCheck.rows.length > 0) {
+      return { status: 'rejected', error: 'Singer already has this song in the queue' };
+    }
+  }
+
+  const posr = await query<{ p: number }>(`SELECT COALESCE(MAX(position),0)+1 AS p FROM queue`);
+  const position = (posr.rows[0] as any).p;
+  const inserted = await query<{ id: string }>(
+    `INSERT INTO queue(track_id, requested_by, singer_id, status, position, key_adjustment, notes)
+     VALUES ($1,$2,$3,'queued',$4,$5,$6)
+     RETURNING id`,
+    [trackId, requestedBy, singerId, position, keyAdjustment, request.notes || null],
+  );
+  await resortQueueByRotation();
+  postQueueUpdate('queue.updated');
+  return { status: 'queued', stationQueueId: String(inserted.rows[0].id) };
+}
+
+async function pullRemoteGatewayRequests(config: RemoteGatewayConfig) {
+  const pending = await callRemoteGateway(config, '/api/station/requests/pending?limit=100') as RemoteGatewayPendingRequest[];
+  const results = {
+    received: Array.isArray(pending) ? pending.length : 0,
+    queued: 0,
+    rejected: 0,
+  };
+  if (!Array.isArray(pending)) return results;
+
+  for (const request of pending) {
+    const result = await queueRemoteGatewayRequest(request);
+    if (result.status === 'queued') {
+      results.queued += 1;
+    } else {
+      results.rejected += 1;
+    }
+    await callRemoteGateway(config, `/api/station/requests/${encodeURIComponent(request.id)}/ack`, {
+      method: 'POST',
+      body: JSON.stringify(result),
+    });
+  }
+  return results;
+}
+
+async function applyRemoteGatewayQueueAction(action: RemoteGatewayQueueAction): Promise<{ status: 'applied' | 'rejected'; error?: string }> {
+  const requesterName = String(action.requestedBy ?? '').trim();
+  const singerUuid = normalizeSingerUuid(action.singerUuid);
+  const normalizedRequester = normalizeSingerName(requesterName);
+
+  async function ownsQueueItem(queueId: number): Promise<boolean> {
+    const row = await query<{ requested_by: string | null; public_uuid: string | null; status: string }>(
+      `SELECT q.requested_by, s.public_uuid, q.status
+         FROM queue q
+         LEFT JOIN singers s ON s.id = q.singer_id
+        WHERE q.id = $1
+        LIMIT 1`,
+      [queueId],
+    );
+    if (row.rows.length === 0 || row.rows[0].status !== 'queued') return false;
+    return Boolean(
+      (normalizedRequester && normalizeSingerName(row.rows[0].requested_by ?? '') === normalizedRequester) ||
+      (singerUuid && row.rows[0].public_uuid === singerUuid)
+    );
+  }
+
+  if (action.type === 'remove') {
+    const queueId = Number(action.payload?.queueId);
+    if (!Number.isFinite(queueId)) return { status: 'rejected', error: 'Invalid queue id' };
+    if (!(await ownsQueueItem(queueId))) return { status: 'rejected', error: 'Queue item is not removable by this singer' };
+    await query(`UPDATE queue SET status = 'removed' WHERE id = $1 AND status = 'queued'`, [queueId]);
+    await resortQueueByRotation();
+    postQueueUpdate('queue.updated');
+    return { status: 'applied' };
+  }
+
+  if (action.type === 'reorder') {
+    const queueIds = Array.isArray(action.payload?.queueIds)
+      ? action.payload!.queueIds!.map((id) => Number(id)).filter((id) => Number.isFinite(id))
+      : [];
+    if (queueIds.length === 0) return { status: 'rejected', error: 'No queue ids provided' };
+    for (const queueId of queueIds) {
+      if (!(await ownsQueueItem(queueId))) {
+        return { status: 'rejected', error: `Queue item ${queueId} is not reorderable by this singer` };
+      }
+    }
+
+    const curRes = await query<{ id: string; position: number }>(
+      `SELECT q.id, q.position
+         FROM queue q
+         LEFT JOIN singers s ON s.id = q.singer_id
+        WHERE q.status = 'queued'
+          AND (
+            ($1 <> '' AND LOWER(TRIM(q.requested_by)) = $1)
+            OR ($2 <> '' AND s.public_uuid = $2)
+          )
+        ORDER BY q.position`,
+      [normalizedRequester, singerUuid || ''],
+    );
+    const sortedPositions = curRes.rows.map((row) => row.position).sort((a, b) => a - b);
+    const TEMP_OFFSET = 2_500_000;
+    await query('BEGIN');
+    try {
+      for (let i = 0; i < queueIds.length && i < sortedPositions.length; i++) {
+        await query(`UPDATE queue SET position = $1 WHERE id = $2`, [TEMP_OFFSET + i, queueIds[i]]);
+      }
+      for (let i = 0; i < queueIds.length && i < sortedPositions.length; i++) {
+        await query(`UPDATE queue SET position = $1 WHERE id = $2`, [sortedPositions[i], queueIds[i]]);
+      }
+      await query('COMMIT');
+    } catch (error) {
+      await query('ROLLBACK');
+      throw error;
+    }
+    await resortQueueByRotation();
+    postQueueUpdate('queue.updated');
+    return { status: 'applied' };
+  }
+
+  return { status: 'rejected', error: 'Unsupported queue action' };
+}
+
+async function pullRemoteGatewayQueueActions(config: RemoteGatewayConfig) {
+  const pending = await callRemoteGateway(config, '/api/station/queue-actions/pending?limit=100') as RemoteGatewayQueueAction[];
+  const results = {
+    received: Array.isArray(pending) ? pending.length : 0,
+    applied: 0,
+    rejected: 0,
+  };
+  if (!Array.isArray(pending)) return results;
+
+  for (const action of pending) {
+    const result = await applyRemoteGatewayQueueAction(action);
+    if (result.status === 'applied') {
+      results.applied += 1;
+    } else {
+      results.rejected += 1;
+    }
+    await callRemoteGateway(config, `/api/station/queue-actions/${encodeURIComponent(action.id)}/ack`, {
+      method: 'POST',
+      body: JSON.stringify(result),
+    });
+  }
+  return results;
+}
+
+async function runRemoteGatewaySync(options: { includeCatalog: boolean }) {
+  const config = await getRemoteGatewayConfig();
+  const settings = await pushRemoteGatewaySettings(config);
+  const catalog = options.includeCatalog ? await pushRemoteGatewayCatalog(config) : null;
+  if (catalog) {
+    remoteGatewayLastCatalogSync = Date.now();
+  }
+  const pulledRequests = await pullRemoteGatewayRequests(config);
+  const queueActions = await pullRemoteGatewayQueueActions(config);
+  const queue = await pushRemoteGatewayQueueSnapshot(config);
+  const status = await getRemoteGatewayStatus(config);
+  return {
+    ok: true,
+    gatewayUrl: config.url,
+    settings,
+    catalog,
+    pulledRequests,
+    queueActions,
+    queue,
+    status,
+  };
+}
+
+async function getRemoteGatewayPollIntervalMs(): Promise<number> {
+  const raw = await getSetting('remote_gateway.poll_interval_seconds');
+  const parsed = Number(raw ?? DEFAULT_REMOTE_GATEWAY_POLL_SECONDS);
+  const seconds = Number.isFinite(parsed) ? Math.max(MIN_REMOTE_GATEWAY_POLL_SECONDS, parsed) : DEFAULT_REMOTE_GATEWAY_POLL_SECONDS;
+  return Math.round(seconds * 1000);
+}
+
+function clearRemoteGatewayTimer() {
+  if (remoteGatewayTimer) {
+    clearTimeout(remoteGatewayTimer);
+    remoteGatewayTimer = null;
+  }
+}
+
+async function scheduleNextRemoteGatewayPoll(delayMs?: number) {
+  clearRemoteGatewayTimer();
+  const intervalMs = delayMs ?? await getRemoteGatewayPollIntervalMs();
+  remoteGatewayTimer = setTimeout(() => {
+    void runRemoteGatewayPollCycle();
+  }, intervalMs);
+  remoteGatewayTimer.unref?.();
+}
+
+async function runRemoteGatewayPollCycle() {
+  if (process.env.STATION_MODE !== 'true') return;
+  if (remoteGatewayInFlight) return remoteGatewayInFlight;
+
+  remoteGatewayInFlight = (async () => {
+    try {
+      const config = await getRemoteGatewayConfig();
+      const shouldRefreshCatalog = Date.now() - remoteGatewayLastCatalogSync > REMOTE_GATEWAY_CATALOG_REFRESH_MS;
+      const result = await runRemoteGatewaySync({ includeCatalog: shouldRefreshCatalog });
+      logger.info(
+        `[remoteGateway] poll complete: queued ${result.pulledRequests.queued}, rejected ${result.pulledRequests.rejected}, gateway pending ${result.status?.pendingRequests ?? 0}.`
+      );
+    } catch (err: any) {
+      if (!String(err?.message || '').includes('not configured')) {
+        logger.warn('[remoteGateway] poll failed:', err);
+      }
+    } finally {
+      remoteGatewayInFlight = null;
+      await scheduleNextRemoteGatewayPoll();
+    }
+  })();
+
+  return remoteGatewayInFlight;
+}
+
+export async function syncRemoteGatewayTaskState(options: { runImmediately?: boolean } = {}) {
+  if (process.env.STATION_MODE !== 'true') {
+    clearRemoteGatewayTimer();
+    return;
+  }
+
+  if (options.runImmediately) {
+    if (remoteGatewayInFlight) {
+      await remoteGatewayInFlight;
+    }
+    await runRemoteGatewayPollCycle();
+    return;
+  }
+
+  if (!remoteGatewayTimer && !remoteGatewayInFlight) {
+    await scheduleNextRemoteGatewayPoll(1_000);
+  }
 }
 
 function isSingerHistoryKdFile(value: any): value is SingerHistoryKdFile {
@@ -241,6 +770,17 @@ async function resolveSingerForRequester(name: string, singerUuid?: string | nul
     };
   }
   return null;
+}
+
+function getUserRequesterName(user: User | null): string {
+  return String(user?.display_name || user?.username || '').trim();
+}
+
+async function getAuthenticatedRequesterSinger(req: express.Request, requestedBy: string): Promise<SingerRow | null> {
+  const user = await getOptionalAuthenticatedUser(req);
+  const userName = getUserRequesterName(user);
+  if (!userName) return null;
+  return findOrCreateSinger(userName, null);
 }
 
 async function updateActiveQueueRequesterName(singerId: bigint, displayName: string): Promise<void> {
@@ -387,6 +927,7 @@ async function resolveKdTrack(song: SingerHistoryKdSong): Promise<number | null>
     const artistId = song.artist ? await upsertArtist(song.artist) : null;
     const track = await upsertExternalTrack({
       artist_id: artistId,
+      disc_id: null,
       title: song.title || song.track.url,
       external_url: song.track.url,
       source: song.track.source || 'karaoke-nerds',
@@ -471,6 +1012,16 @@ const getOidcDisplayName = (claims: Record<string, unknown>, fallback: string): 
 const getOidcPicture = (claims: Record<string, unknown>): string | null => {
   const picture = typeof claims.picture === 'string' ? claims.picture.trim() : '';
   return picture || null;
+};
+
+const getOidcErrorMessage = (err: any): string => {
+  const description = err?.error_description || err?.cause?.error_description;
+  if (typeof description === 'string' && description.trim()) return description.trim();
+  const error = err?.error || err?.cause?.error;
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  const message = err?.message;
+  if (typeof message === 'string' && message.trim()) return message.trim();
+  return 'OIDC error';
 };
 
 const findAvailableOidcUsername = async (baseUsername: string, currentUserId?: number): Promise<string | null> => {
@@ -1142,6 +1693,15 @@ apiRouter.delete(
 apiRouter.get(
   '/auth/oidc/config',
   ah(async (_req, res) => {
+    if (process.env.STATION_MODE === 'true') {
+      return res.json({
+        enabled: false,
+        buttonText: 'Login with SSO',
+        buttonColor: '#6366f1',
+        passwordLoginEnabled: true,
+      });
+    }
+
     const enabled = await getSetting('oidc.enabled');
     const buttonText = await getSetting('oidc.button_text');
     const buttonColor = await getSetting('oidc.button_color');
@@ -1160,6 +1720,22 @@ apiRouter.get(
   '/admin/settings/oidc',
   adminGuard,
   ah(async (_req, res) => {
+    if (process.env.STATION_MODE === 'true') {
+      return res.json({
+        enabled: false,
+        issuer: '',
+        clientId: '',
+        clientSecret: '',
+        redirectUri: '',
+        buttonText: 'Login with SSO',
+        buttonColor: '#6366f1',
+        autoCreateUsers: false,
+        defaultRole: 'user',
+        passwordLoginEnabled: true,
+        stationMode: true,
+      });
+    }
+
     const [enabled, issuer, clientId, clientSecret, redirectUri, buttonText, buttonColor, autoCreate, defaultRole, passwordLoginEnabled] =
       await Promise.all([
         getSetting('oidc.enabled'),
@@ -1193,6 +1769,10 @@ apiRouter.put(
   '/admin/settings/oidc',
   adminGuard,
   ah(async (req, res) => {
+    if (process.env.STATION_MODE === 'true') {
+      return res.status(403).json({ error: 'OIDC/SSO is not available in Station mode' });
+    }
+
     const {
       enabled,
       issuer,
@@ -1253,6 +1833,10 @@ setInterval(() => {
 apiRouter.get(
   '/auth/oidc/login',
   ah(async (req, res) => {
+    if (process.env.STATION_MODE === 'true') {
+      return res.status(404).json({ error: 'OIDC/SSO is not available in Station mode' });
+    }
+
     const oidcEnabled = await getSetting('oidc.enabled');
     if (!oidcEnabled) {
       return res.status(400).json({ error: 'OIDC is not enabled' });
@@ -1261,7 +1845,7 @@ apiRouter.get(
     const issuerUrl = await getSetting('oidc.issuer');
     const clientId = await getSetting('oidc.client_id');
     const clientSecret = await getSetting('oidc.client_secret');
-    const redirectUri = await getSetting('oidc.redirect_uri');
+    const redirectUri = String(await getSetting('oidc.redirect_uri') || '').trim();
 
     if (!issuerUrl || !clientId || !clientSecret || !redirectUri) {
       return res.status(400).json({ error: 'OIDC is not fully configured' });
@@ -1287,7 +1871,7 @@ apiRouter.get(
       oidcStateStore.set(state, { codeVerifier, createdAt: Date.now(), returnTo });
 
       const authUrl = oidc.buildAuthorizationUrl(config, {
-        redirect_uri: redirectUri,
+        redirect_uri: new URL(redirectUri).href,
         scope: 'openid email profile',
         state,
         code_challenge: codeChallenge,
@@ -1314,7 +1898,7 @@ apiRouter.get(
     const issuerUrl = await getSetting('oidc.issuer');
     const clientId = await getSetting('oidc.client_id');
     const clientSecret = await getSetting('oidc.client_secret');
-    const redirectUri = await getSetting('oidc.redirect_uri');
+    const redirectUri = String(await getSetting('oidc.redirect_uri') || '').trim();
 
     if (!issuerUrl || !clientId || !clientSecret || !redirectUri) {
       return res.status(400).send('OIDC is not fully configured');
@@ -1332,10 +1916,7 @@ apiRouter.get(
         oidc.ClientSecretPost(clientSecret),
       );
 
-      const host = req.headers.host || 'localhost:5174';
-      const protoHeader = req.headers['x-forwarded-proto'];
-      const proto = Array.isArray(protoHeader) ? protoHeader[0] : (protoHeader || 'http');
-      const currentUrl = new URL(req.originalUrl, `${proto}://${host}`);
+      const currentUrl = buildOidcGrantCallbackUrl(redirectUri, req.originalUrl);
 
       const stateKey = currentUrl.searchParams.get('state') || '';
 
@@ -1351,9 +1932,6 @@ apiRouter.get(
         {
           expectedState: stateKey,
           pkceCodeVerifier: stored.codeVerifier,
-        },
-        {
-          redirect_uri: redirectUri,
         },
       );
 
@@ -1435,7 +2013,7 @@ apiRouter.get(
     } catch (err: any) {
       console.error('OIDC callback error:', err);
       const frontendUrl = await getOidcFrontendUrl(req).catch(() => '');
-      res.redirect(`${frontendUrl}/admin?oidc_error=${encodeURIComponent(err.message || 'OIDC error')}`);
+      res.redirect(`${frontendUrl}/admin?oidc_error=${encodeURIComponent(getOidcErrorMessage(err))}`);
     }
   })
 );
@@ -1493,7 +2071,15 @@ function getPublicWebAppUrl(req: express.Request): string {
   return `${proto}://${host}`.replace(/\/$/, '');
 }
 
-function getPublicRequestsUrl(req: express.Request): string {
+async function getPublicRequestsUrl(req: express.Request): Promise<string> {
+  const [gatewayEnabled, gatewayUrl] = await Promise.all([
+    getSetting('remote_gateway.enabled'),
+    getSetting('remote_gateway.url'),
+  ]);
+  const normalizedGatewayUrl = String(gatewayUrl ?? '').trim().replace(/\/+$/, '');
+  if (gatewayEnabled === true && normalizedGatewayUrl) {
+    return normalizedGatewayUrl;
+  }
   return `${getPublicWebAppUrl(req)}/requests`;
 }
 
@@ -1568,8 +2154,27 @@ apiRouter.delete(
   ah(async (req, res) => {
     const id = toInt(req.params.id);
     if (id == null) return res.status(400).send('id required');
-    await query(`DELETE FROM libraries WHERE id = $1`, [id]);
-    res.json({ ok: true });
+    const result = await query<{ detached_tracks: string; deleted_libraries: string }>(
+      `
+      WITH detached AS (
+        UPDATE tracks SET library_id = NULL WHERE library_id = $1
+        RETURNING 1
+      ),
+      deleted AS (
+        DELETE FROM libraries WHERE id = $1
+        RETURNING 1
+      )
+      SELECT
+        (SELECT COUNT(*) FROM detached) AS detached_tracks,
+        (SELECT COUNT(*) FROM deleted) AS deleted_libraries
+      `,
+      [id]
+    );
+    const row = result.rows[0];
+    if (!row || Number(row.deleted_libraries) === 0) {
+      return res.status(404).json({ error: 'Library not found' });
+    }
+    res.json({ ok: true, detachedTracks: Number(row.detached_tracks) });
   })
 );
 
@@ -1620,16 +2225,16 @@ apiRouter.get(
 
 const ARTIST_BROWSE_LETTER_SQL = `
   CASE
-    WHEN substring(regexp_replace(COALESCE(a.name, ''), '^[^[:alnum:]]+', '') from 1 for 1) ~ '^[A-Za-z]$'
-      THEN upper(substring(regexp_replace(COALESCE(a.name, ''), '^[^[:alnum:]]+', '') from 1 for 1))
+    WHEN substring(BTRIM(COALESCE(a.name, '')) from 1 for 1) ~ '^[A-Za-z]$'
+      THEN upper(substring(BTRIM(COALESCE(a.name, '')) from 1 for 1))
     ELSE '#'
   END
 `;
 
 const TITLE_BROWSE_LETTER_SQL = `
   CASE
-    WHEN substring(regexp_replace(COALESCE(t.title, ''), '^[^[:alnum:]]+', '') from 1 for 1) ~ '^[A-Za-z]$'
-      THEN upper(substring(regexp_replace(COALESCE(t.title, ''), '^[^[:alnum:]]+', '') from 1 for 1))
+    WHEN substring(BTRIM(COALESCE(t.title, '')) from 1 for 1) ~ '^[A-Za-z]$'
+      THEN upper(substring(BTRIM(COALESCE(t.title, '')) from 1 for 1))
     ELSE '#'
   END
 `;
@@ -1919,11 +2524,15 @@ apiRouter.get(
       kindClause = ` AND t.kind = $${params.length}`;
     }
 
-    const result = await query<{ artist: string }>(
+    const result = await query<{ artist: string; songCount: string; versionCount: string }>(
       `
-      SELECT artist
+      SELECT artist,
+             song_count AS "songCount",
+             version_count AS "versionCount"
         FROM (
-          SELECT DISTINCT a.name AS artist,
+          SELECT a.name AS artist,
+                 COUNT(DISTINCT LOWER(BTRIM(COALESCE(t.title, '')))) AS song_count,
+                 COUNT(*) AS version_count,
                  LOWER(a.name) AS sort_artist
             FROM tracks t
             LEFT JOIN artists a ON a.id = t.artist_id
@@ -1932,13 +2541,20 @@ apiRouter.get(
              AND BTRIM(a.name) <> ''
              AND ${ARTIST_BROWSE_LETTER_SQL} = $1
              ${kindClause}
+           GROUP BY a.name
         ) artists
        ORDER BY sort_artist
       `,
       params
     );
 
-    res.json({ artists: result.rows.map((row) => row.artist) });
+    res.json({
+      artists: result.rows.map((row) => ({
+        artist: row.artist,
+        songCount: Number(row.songCount),
+        versionCount: Number(row.versionCount),
+      })),
+    });
   })
 );
 
@@ -2068,7 +2684,7 @@ apiRouter.post(
       return res.status(403).json({ error: 'External library is disabled' });
     }
     
-    const { title, artist, url, requestedBy, keyAdjustment } = req.body;
+    const { title, artist, url, requestedBy, keyAdjustment, brand, discId } = req.body;
     const singerUuid = normalizeSingerUuid(req.body?.singerUuid);
     
     if (!title || !url) {
@@ -2097,6 +2713,7 @@ apiRouter.post(
     // Upsert the external track
     const track = await upsertExternalTrack({
       artist_id: artistId,
+      disc_id: brand || discId || null,
       title,
       external_url: url,
       source: 'karaoke-nerds',
@@ -2114,10 +2731,12 @@ apiRouter.post(
 
     // Find or create singer for this request
     let kn_singerId: bigint | null = null;
+    let queueRequestedBy = requestedBy || null;
     if (requestedBy && requestedBy.trim()) {
       try {
-        const singer = await findOrCreateSinger(requestedBy, singerUuid);
+        const singer = await getAuthenticatedRequesterSinger(req, requestedBy) ?? await findOrCreateSinger(requestedBy, singerUuid);
         kn_singerId = singer.id;
+        queueRequestedBy = singer.display_name || requestedBy;
         await ensureSingerInActiveRotation(kn_singerId);
       } catch (err) {
         console.error('findOrCreateSinger / ensureSingerInActiveRotation failed:', err);
@@ -2130,7 +2749,7 @@ apiRouter.post(
         `INSERT INTO queue(track_id, requested_by, singer_id, status, position, key_adjustment)
          VALUES ($1,$2,$3,'queued',$4,$5)
          RETURNING id, track_id, requested_by, singer_id, status, position, key_adjustment, created_at`,
-        [track.id, requestedBy || null, kn_singerId, position, keyAdj]
+        [track.id, queueRequestedBy, kn_singerId, position, keyAdj]
       );
       res.json(r.rows[0]);
       await resortQueueByRotation();
@@ -2149,7 +2768,7 @@ apiRouter.post(
           `INSERT INTO queue(track_id, requested_by, singer_id, status, position)
            VALUES ($1,$2,$3,'queued',$4)
            RETURNING id, track_id, requested_by, singer_id, status, position, created_at`,
-          [track.id, requestedBy || null, kn_singerId, position]
+          [track.id, queueRequestedBy, kn_singerId, position]
         );
         res.json(r.rows[0]);
         await resortQueueByRotation();
@@ -2938,6 +3557,22 @@ apiRouter.get(
     const singerUuid = normalizeSingerUuid(req.query.singerUuid);
     if (!name) return res.status(400).json({ error: 'name is required' });
     const norm = normalizeSingerName(name);
+    const authenticatedSinger = await getAuthenticatedRequesterSinger(req, name);
+    if (authenticatedSinger) {
+      const qRes = await query(
+        `SELECT q.id, q.track_id, q.status, q.position, q.created_at, q.started_at, q.finished_at,
+                t.title, t.kind, a.name AS artist
+           FROM queue q
+           JOIN tracks t ON t.id = q.track_id
+           LEFT JOIN artists a ON a.id = t.artist_id
+          WHERE q.status != 'removed'
+            AND q.singer_id = $1
+          ORDER BY CASE q.status WHEN 'playing' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, q.position`,
+        [authenticatedSinger.id],
+      );
+      return res.json(qRes.rows);
+    }
+
     // Prefer singer_id-based lookup
     const singer = await resolveSingerForRequester(name, singerUuid);
     let rows: any[];
@@ -3006,17 +3641,27 @@ apiRouter.post(
     }
 
     const row = item.rows[0];
-    const singer = await resolveSingerForRequester(requesterName, singerUuid);
+    const authenticatedSinger = await getAuthenticatedRequesterSinger(req, requesterName);
+    const singer = authenticatedSinger
+      ? {
+          id: String(authenticatedSinger.id),
+          publicUuid: authenticatedSinger.public_uuid,
+          displayName: authenticatedSinger.display_name,
+          normalizedName: authenticatedSinger.normalized_name,
+        }
+      : await resolveSingerForRequester(requesterName, singerUuid);
     const requesterOwnsItem =
-      normalizeSingerName(row.requested_by ?? '') === norm ||
-      (singer && row.singer_id !== null && String(row.singer_id) === String(singer.id));
+      (authenticatedSinger
+        ? row.singer_id !== null && String(row.singer_id) === String(authenticatedSinger.id)
+        : normalizeSingerName(row.requested_by ?? '') === norm ||
+          (singer && row.singer_id !== null && String(row.singer_id) === String(singer.id)));
     if (!requesterOwnsItem) {
       return res.status(403).json({ error: 'You can only re-add your own songs' });
     }
 
     let singerId: bigint | null = row.singer_id !== null ? BigInt(row.singer_id) : null;
     try {
-      const singer = await findOrCreateSinger(requesterName, singerUuid);
+      const singer = authenticatedSinger ?? await findOrCreateSinger(requesterName, singerUuid);
       singerId = singer.id;
       await ensureSingerInActiveRotation(singerId);
     } catch (err) {
@@ -3042,7 +3687,7 @@ apiRouter.post(
       `INSERT INTO queue(track_id, requested_by, singer_id, status, position, key_adjustment)
        VALUES ($1,$2,$3,'queued',$4,$5)
        RETURNING id, track_id, requested_by, singer_id, status, position, key_adjustment, created_at`,
-      [trackId, requesterName, singerId, position, keyAdjustment],
+      [trackId, (authenticatedSinger?.display_name || requesterName), singerId, position, keyAdjustment],
     );
 
     await resortQueueByRotation();
@@ -3075,12 +3720,17 @@ apiRouter.delete(
     }
     const normalizedRequester = normalizeSingerName(requesterName);
     const normalizedOwner = normalizeSingerName(item.rows[0].requested_by ?? '');
-    const singer = await resolveSingerForRequester(requesterName, singerUuid);
+    const authenticatedSinger = await getAuthenticatedRequesterSinger(req, requesterName);
+    const singer = authenticatedSinger
+      ? null
+      : await resolveSingerForRequester(requesterName, singerUuid);
     const requesterOwnsItem =
-      normalizedRequester === normalizedOwner ||
-      (singer &&
-        item.rows[0].singer_id !== null &&
-        String(item.rows[0].singer_id) === String(singer.id));
+      authenticatedSinger
+        ? item.rows[0].singer_id !== null && String(item.rows[0].singer_id) === String(authenticatedSinger.id)
+        : normalizedRequester === normalizedOwner ||
+          (singer &&
+            item.rows[0].singer_id !== null &&
+            String(item.rows[0].singer_id) === String(singer.id));
     if (!requesterOwnsItem) {
       return res.status(403).json({ error: 'You can only remove your own songs' });
     }
@@ -3108,18 +3758,34 @@ apiRouter.patch(
     const norm = normalizeSingerName(requesterName);
 
     // Resolve singer_id for this requester
-    const singer = await resolveSingerForRequester(requesterName, rawSingerUuid);
+    const authenticatedSinger = await getAuthenticatedRequesterSinger(req, requesterName);
+    const singer = authenticatedSinger
+      ? {
+          id: String(authenticatedSinger.id),
+          publicUuid: authenticatedSinger.public_uuid,
+          displayName: authenticatedSinger.display_name,
+          normalizedName: authenticatedSinger.normalized_name,
+        }
+      : await resolveSingerForRequester(requesterName, rawSingerUuid);
 
     let ownedIds: Set<number>;
     if (singer) {
       const singerId = singer.id;
-      const owned = await query<{ id: string }>(
-        `SELECT id FROM queue
-          WHERE status = 'queued'
-            AND id = ANY($2::bigint[])
-            AND (singer_id = $1 OR LOWER(TRIM(requested_by)) = $3)`,
-        [singerId, orderedQueueIds, norm],
-      );
+      const owned = authenticatedSinger
+        ? await query<{ id: string }>(
+            `SELECT id FROM queue
+              WHERE status = 'queued'
+                AND id = ANY($2::bigint[])
+                AND singer_id = $1`,
+            [singerId, orderedQueueIds],
+          )
+        : await query<{ id: string }>(
+            `SELECT id FROM queue
+              WHERE status = 'queued'
+                AND id = ANY($2::bigint[])
+                AND (singer_id = $1 OR LOWER(TRIM(requested_by)) = $3)`,
+            [singerId, orderedQueueIds, norm],
+          );
       ownedIds = new Set(owned.rows.map((r) => Number(r.id)));
     } else {
       const owned = await query<{ id: string }>(
@@ -3139,13 +3805,21 @@ apiRouter.patch(
     let curRes: { rows: { id: string; position: number }[] };
     if (singer) {
       const singerId = singer.id;
-      curRes = await query<{ id: string; position: number }>(
-        `SELECT id, position FROM queue
-          WHERE status = 'queued'
-            AND (singer_id = $1 OR LOWER(TRIM(requested_by)) = $2)
-          ORDER BY position`,
-        [singerId, norm],
-      );
+      curRes = authenticatedSinger
+        ? await query<{ id: string; position: number }>(
+            `SELECT id, position FROM queue
+              WHERE status = 'queued'
+                AND singer_id = $1
+              ORDER BY position`,
+            [singerId],
+          )
+        : await query<{ id: string; position: number }>(
+            `SELECT id, position FROM queue
+              WHERE status = 'queued'
+                AND (singer_id = $1 OR LOWER(TRIM(requested_by)) = $2)
+              ORDER BY position`,
+            [singerId, norm],
+          );
     } else {
       curRes = await query<{ id: string; position: number }>(
         `SELECT id, position FROM queue WHERE LOWER(TRIM(requested_by)) = $1 AND status = 'queued' ORDER BY position`,
@@ -3249,10 +3923,12 @@ apiRouter.post(
 
     // Find or create singer, then ensure they are in the active rotation.
     let singerId: bigint | null = null;
+    let queueRequestedBy = requestedBy;
     if (requestedBy && requestedBy.trim()) {
       try {
-        const singer = await findOrCreateSinger(requestedBy, singerUuid);
+        const singer = await getAuthenticatedRequesterSinger(req, requestedBy) ?? await findOrCreateSinger(requestedBy, singerUuid);
         singerId = singer.id;
+        queueRequestedBy = singer.display_name || requestedBy;
         await ensureSingerInActiveRotation(singerId);
       } catch (err) {
         console.error('findOrCreateSinger / ensureSingerInActiveRotation failed:', err);
@@ -3276,9 +3952,9 @@ apiRouter.post(
         `INSERT INTO queue(track_id, requested_by, singer_id, status, position, key_adjustment)
          VALUES ($1,$2,$3,'queued',$4,$5)
          RETURNING id, track_id, requested_by, singer_id, status, position, key_adjustment, created_at`,
-        [trackId, requestedBy, singerId, position, keyAdjustment]
+        [trackId, queueRequestedBy, singerId, position, keyAdjustment]
       );
-      logger.info(`Singer request queued: "${requestedBy ?? 'anonymous'}" added track ${trackId} (queue id ${r.rows[0].id})`);
+      logger.info(`Singer request queued: "${queueRequestedBy ?? 'anonymous'}" added track ${trackId} (queue id ${r.rows[0].id})`);
       res.json(r.rows[0]);
     } catch (err: any) {
       // If key_adjustment column doesn't exist, fall back to insert without it
@@ -3293,9 +3969,9 @@ apiRouter.post(
           `INSERT INTO queue(track_id, requested_by, singer_id, status, position)
            VALUES ($1,$2,$3,'queued',$4)
            RETURNING id, track_id, requested_by, singer_id, status, position, created_at`,
-          [trackId, requestedBy, singerId, position]
+          [trackId, queueRequestedBy, singerId, position]
         );
-        logger.info(`Singer request queued: "${requestedBy ?? 'anonymous'}" added track ${trackId} (queue id ${r.rows[0].id})`);
+        logger.info(`Singer request queued: "${queueRequestedBy ?? 'anonymous'}" added track ${trackId} (queue id ${r.rows[0].id})`);
         res.json(r.rows[0]);
       } else {
         // Re-throw if it's a different error
@@ -3442,11 +4118,13 @@ apiRouter.post(
       const artist = String(external.artist ?? '').trim();
       const url = String(external.url ?? '').trim();
       const source = String(external.source ?? 'karaoke-nerds').trim() || 'karaoke-nerds';
+      const discId = String(external.discId ?? external.brand ?? '').trim();
       if (!title || !url) return res.status(400).send('external.title and external.url are required');
       const { upsertArtist, upsertExternalTrack } = await import('../db');
       const artistId = artist ? await upsertArtist(artist) : null;
       const track = await upsertExternalTrack({
         artist_id: artistId,
+        disc_id: discId || null,
         title,
         external_url: url,
         source,
@@ -3540,6 +4218,7 @@ apiRouter.get(
       `
       SELECT q.id, q.track_id, q.position, q.requested_by, q.status,
              t.title, t.kind, t.file_mp4, t.file_mp3, t.file_cdg, t.path,
+             t.duration_ms,
              t.external_url, t.source,
              a.name AS artist
         FROM queue q
@@ -3622,6 +4301,7 @@ apiRouter.post(
     }
     
     let songStarted = false;
+    let startedQueueId: number | null = null;
     if (trackToPlay) {
       const singerLabel = trackToPlay.requested_by ? ` (requested by ${trackToPlay.requested_by})` : '';
       const artistLabel = trackToPlay.artist ? ` by ${trackToPlay.artist}` : '';
@@ -3634,6 +4314,7 @@ apiRouter.post(
       if (id != null) {
         const updateResult = await query<{ id: number }>(`UPDATE queue SET status = 'playing', started_at = NOW() WHERE id = $1 RETURNING id`, [id]);
         songStarted = updateResult.rows.length > 0;
+        startedQueueId = updateResult.rows[0]?.id ?? null;
       } else {
         // play top
         const updateResult = await query<{ id: number }>(`
@@ -3642,10 +4323,14 @@ apiRouter.post(
            RETURNING id
         `);
         songStarted = updateResult.rows.length > 0;
+        startedQueueId = updateResult.rows[0]?.id ?? null;
       }
       await query('COMMIT');
     } catch (e) {
       await query('ROLLBACK'); throw e;
+    }
+    if (startedQueueId != null) {
+      await ensureQueueTrackDurationBeforePlayback(startedQueueId);
     }
     postQueueUpdate('player.play');
     if (songStarted) {
@@ -3697,12 +4382,14 @@ apiRouter.post(
       }
     }
 
-    postQueueUpdate('player.next');
     // Resume break music only when there is no next karaoke song to play
     const stillPlaying = await query<{ id: number }>(`SELECT id FROM queue WHERE status = 'playing' LIMIT 1`);
-    if (!stillPlaying.rows.length) {
+    if (stillPlaying.rows.length) {
+      await ensureQueueTrackDurationBeforePlayback(stillPlaying.rows[0].id);
+    } else {
       await autoResumeBreakMusicForKaraoke();
     }
+    postQueueUpdate('player.next');
     res.json({ ok: true });
   })
 );
@@ -3879,6 +4566,62 @@ async function checkInitialAutoplayConditions(): Promise<{
   };
 }
 
+type QueueTrackDurationRow = {
+  id: number;
+  track_id: number;
+  key_adjustment?: number | null;
+  duration_ms: number | null;
+  kind: string;
+  file_mp4: string | null;
+  file_mp3: string | null;
+  file_cdg: string | null;
+  title: string | null;
+};
+
+async function ensureQueueTrackDurationBeforePlayback(queueId: number | string | null | undefined): Promise<number | null> {
+  if (queueId == null) return null;
+  const id = normalizeQueueId(queueId);
+  if (id == null) return null;
+
+  const result = await query<QueueTrackDurationRow>(
+    `SELECT q.id,
+            q.track_id,
+            q.key_adjustment,
+            t.duration_ms,
+            t.kind,
+            t.file_mp4,
+            t.file_mp3,
+            t.file_cdg,
+            t.title
+       FROM queue q
+       JOIN tracks t ON t.id = q.track_id
+      WHERE q.id = $1`,
+    [id],
+  );
+  if (result.rows.length === 0) return null;
+
+  const track = result.rows[0];
+  if (track.duration_ms != null && track.duration_ms > 0) {
+    return Number(track.duration_ms);
+  }
+
+  logger.info(`Track ${track.track_id}: duration missing before playback; extracting now (${track.title ?? 'untitled'})`);
+  const extractedDuration = await extractTrackDuration({
+    kind: track.kind,
+    file_mp4: track.file_mp4,
+    file_mp3: track.file_mp3,
+  });
+
+  if (extractedDuration != null && extractedDuration > 0) {
+    await query('UPDATE tracks SET duration_ms = $1 WHERE id = $2', [extractedDuration, track.track_id]);
+    logger.info(`Track ${track.track_id}: cached duration before playback: ${extractedDuration}ms (${Math.round(extractedDuration / 1000)}s)`);
+    return extractedDuration;
+  }
+
+  logger.warn(`Track ${track.track_id}: unable to extract duration before playback`);
+  return null;
+}
+
 // Periodic check for initial autoplay - starts first song if:
 // 1. No song is playing
 // 2. Autoplay is enabled  
@@ -3946,6 +4689,7 @@ setInterval(async () => {
             if (result.rows.length > 0) {
               const { id, title, artist } = result.rows[0];
               const songLabel = [artist, title].filter(Boolean).join(' - ') || `ID: ${id}`;
+              await ensureQueueTrackDurationBeforePlayback(id);
               logger.info(`Initial autoplay: Started first song — ${songLabel}`);
               postQueueUpdate('player.play');
               await autoPauseBreakMusicForKaraoke();
@@ -4174,6 +4918,7 @@ apiRouter.post(
                 if (result.rows.length > 0) {
                   const { id, title, artist } = result.rows[0];
                   const songLabel = [artist, title].filter(Boolean).join(' - ') || `ID: ${id}`;
+                  await ensureQueueTrackDurationBeforePlayback(id);
                   logger.info(`Autoplay: Started next song — ${songLabel}`);
                   // Pause break music now that the next karaoke song is starting
                   await autoPauseBreakMusicForKaraoke();
@@ -4579,7 +5324,7 @@ apiRouter.get(
       'libraries.external_enabled': settings['libraries.external_enabled'] ?? true,
       'requests.acceptance': settings['requests.acceptance'] ?? 'local',
       'requests.local_browse_enabled': settings['requests.local_browse_enabled'] ?? true,
-      'requests.url': getPublicRequestsUrl(req),
+      'requests.url': await getPublicRequestsUrl(req),
     };
     
     res.json(completeSettings);
@@ -4596,7 +5341,31 @@ apiRouter.get(
     for (const row of result.rows) {
       settings[row.key] = row.value;
     }
+    settings['station.mode'] = process.env.STATION_MODE === 'true';
     res.json(settings);
+  })
+);
+
+apiRouter.post(
+  '/admin/remote-gateway/test',
+  adminGuard,
+  ah(async (_req, res) => {
+    const config = await getRemoteGatewayConfig();
+    await pushRemoteGatewaySettings(config);
+    const status = await getRemoteGatewayStatus(config);
+    res.json({
+      ok: true,
+      gatewayUrl: config.url,
+      status,
+    });
+  })
+);
+
+apiRouter.post(
+  '/admin/remote-gateway/sync',
+  adminGuard,
+  ah(async (_req, res) => {
+    res.json(await runRemoteGatewaySync({ includeCatalog: true }));
   })
 );
 
@@ -4633,6 +5402,19 @@ apiRouter.put(
 
     if (key === 'admin.background_break_music_scan_enabled') {
       await syncBreakMusicScanTaskState({ runImmediately: value !== false });
+    }
+
+    if (
+      key === 'remote_gateway.url' ||
+      key === 'remote_gateway.enabled' ||
+      key === 'remote_gateway.api_token' ||
+      key === 'remote_gateway.poll_interval_seconds' ||
+      key === 'libraries.local_enabled' ||
+      key === 'libraries.external_enabled' ||
+      key === 'requests.acceptance' ||
+      key === 'requests.local_browse_enabled'
+    ) {
+      await syncRemoteGatewayTaskState({ runImmediately: true });
     }
 
     res.json({ ok: true });

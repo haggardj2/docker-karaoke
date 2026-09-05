@@ -124,6 +124,138 @@ function isPathWithinRoot(candidatePath: string, rootPath: string): boolean {
   return candidatePath === rootPath || candidatePath.startsWith(`${rootPath}${path.sep}`);
 }
 
+const MP3_BITRATES_KBPS: Record<string, number[]> = {
+  V1L1: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0],
+  V1L2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0],
+  V1L3: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0],
+  V2L1: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0],
+  V2L2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+  V2L3: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0],
+};
+
+function parseSynchsafeInt(buffer: Buffer, offset: number): number {
+  return ((buffer[offset] & 0x7f) << 21) |
+    ((buffer[offset + 1] & 0x7f) << 14) |
+    ((buffer[offset + 2] & 0x7f) << 7) |
+    (buffer[offset + 3] & 0x7f);
+}
+
+function getMp3StartOffset(buffer: Buffer): number {
+  if (buffer.length < 10 || buffer.toString('ascii', 0, 3) !== 'ID3') return 0;
+  const hasFooter = (buffer[5] & 0x10) !== 0;
+  return 10 + parseSynchsafeInt(buffer, 6) + (hasFooter ? 10 : 0);
+}
+
+type Mp3FrameInfo = {
+  offset: number;
+  frameLength: number;
+  sampleRate: number;
+  samplesPerFrame: number;
+  bitrateKbps: number;
+  mpegVersion: 1 | 2 | 2.5;
+  channelMode: number;
+};
+
+function readMp3FrameInfo(buffer: Buffer, offset: number): Mp3FrameInfo | null {
+  if (offset + 4 > buffer.length) return null;
+  const header = buffer.readUInt32BE(offset);
+  if ((header & 0xffe00000) !== 0xffe00000) return null;
+
+  const versionBits = (header >> 19) & 0x3;
+  const layerBits = (header >> 17) & 0x3;
+  const bitrateIndex = (header >> 12) & 0xf;
+  const sampleRateIndex = (header >> 10) & 0x3;
+  const padding = (header >> 9) & 0x1;
+  const channelMode = (header >> 6) & 0x3;
+  if (versionBits === 1 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 15 || sampleRateIndex === 3) {
+    return null;
+  }
+
+  const mpegVersion = versionBits === 3 ? 1 : versionBits === 2 ? 2 : 2.5;
+  const layer = 4 - layerBits;
+  const baseSampleRates = [44100, 48000, 32000];
+  const sampleRate = Math.round(baseSampleRates[sampleRateIndex] / (mpegVersion === 1 ? 1 : mpegVersion === 2 ? 2 : 4));
+  const bitrateTableKey = `${mpegVersion === 1 ? 'V1' : 'V2'}L${layer}`;
+  const bitrateKbps = MP3_BITRATES_KBPS[bitrateTableKey]?.[bitrateIndex] || 0;
+  if (!bitrateKbps || !sampleRate) return null;
+
+  const samplesPerFrame = layer === 1 ? 384 : layer === 3 && mpegVersion !== 1 ? 576 : 1152;
+  const frameLength = layer === 1
+    ? Math.floor(((12 * bitrateKbps * 1000) / sampleRate + padding) * 4)
+    : Math.floor(((samplesPerFrame / 8) * bitrateKbps * 1000) / sampleRate + padding);
+  if (frameLength <= 4) return null;
+
+  return { offset, frameLength, sampleRate, samplesPerFrame, bitrateKbps, mpegVersion, channelMode };
+}
+
+function findFirstMp3Frame(buffer: Buffer): Mp3FrameInfo | null {
+  const start = getMp3StartOffset(buffer);
+  for (let offset = start; offset + 4 < buffer.length; offset++) {
+    const frame = readMp3FrameInfo(buffer, offset);
+    if (!frame) continue;
+    const next = readMp3FrameInfo(buffer, offset + frame.frameLength);
+    if (next || offset + frame.frameLength >= buffer.length) return frame;
+  }
+  return null;
+}
+
+function getVbrFrameCount(buffer: Buffer, frame: Mp3FrameInfo): number | null {
+  const sideInfoLength = frame.mpegVersion === 1
+    ? frame.channelMode === 3 ? 21 : 36
+    : frame.channelMode === 3 ? 13 : 21;
+  const xingOffset = frame.offset + sideInfoLength;
+  const xingTag = buffer.toString('ascii', xingOffset, xingOffset + 4);
+  if ((xingTag === 'Xing' || xingTag === 'Info') && xingOffset + 12 <= buffer.length) {
+    const flags = buffer.readUInt32BE(xingOffset + 4);
+    if ((flags & 0x1) !== 0) return buffer.readUInt32BE(xingOffset + 8);
+  }
+
+  const vbriOffset = frame.offset + 36;
+  if (buffer.toString('ascii', vbriOffset, vbriOffset + 4) === 'VBRI' && vbriOffset + 18 <= buffer.length) {
+    return buffer.readUInt32BE(vbriOffset + 14);
+  }
+  return null;
+}
+
+function parseMp3DurationMs(buffer: Buffer): number | null {
+  const firstFrame = findFirstMp3Frame(buffer);
+  if (!firstFrame) return null;
+
+  const vbrFrames = getVbrFrameCount(buffer, firstFrame);
+  if (vbrFrames && vbrFrames > 0) {
+    return Math.round((vbrFrames * firstFrame.samplesPerFrame * 1000) / firstFrame.sampleRate);
+  }
+
+  let frameCount = 0;
+  let offset = firstFrame.offset;
+  while (offset + 4 < buffer.length) {
+    const frame = readMp3FrameInfo(buffer, offset);
+    if (!frame) {
+      offset += 1;
+      continue;
+    }
+    frameCount += 1;
+    offset += frame.frameLength;
+  }
+
+  if (frameCount > 1) {
+    return Math.round((frameCount * firstFrame.samplesPerFrame * 1000) / firstFrame.sampleRate);
+  }
+
+  const audioBytes = Math.max(0, buffer.length - firstFrame.offset);
+  const cbrDurationMs = Math.round((audioBytes * 8 * 1000) / (firstFrame.bitrateKbps * 1000));
+  return cbrDurationMs > 0 ? cbrDurationMs : null;
+}
+
+async function getMp3DurationFromFile(filePath: string): Promise<number | null> {
+  try {
+    return parseMp3DurationMs(await fs.readFile(filePath));
+  } catch (error) {
+    logger.warn(`[scanner] MP3 duration fallback failed for ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
 /**
  * Get duration of a media file using ffprobe
  */
@@ -131,7 +263,7 @@ export async function getMediaDuration(filePath: string): Promise<number | null>
   await ffprobeSemaphore.acquire();
   
   try {
-    return await new Promise((resolve) => {
+    const ffprobeDuration = await new Promise<number | null>((resolve) => {
       let settled = false;
       let timeout: ReturnType<typeof setTimeout> | null = null;
       const finish = (value: number | null) => {
@@ -194,12 +326,17 @@ export async function getMediaDuration(filePath: string): Promise<number | null>
         finish(null);
       });
     });
+    if (ffprobeDuration !== null) return ffprobeDuration;
   } catch (err) {
     console.error(`Exception in getMediaDuration for ${filePath}:`, err);
-    return null;
   } finally {
     ffprobeSemaphore.release();
   }
+
+  if (MP3_RE.test(filePath)) {
+    return getMp3DurationFromFile(filePath);
+  }
+  return null;
 }
 
 export function isBreakMusicFile(filePath: string): boolean {

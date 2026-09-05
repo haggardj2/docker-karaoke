@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Karaoke Requests</title>
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="requests-closed">
+    <main class="requests-page">
+      <div class="top-actions">
+        <button id="profileButton" class="profile-button" type="button">👤 <span id="profileButtonName">Profile</span></button>
+        <div id="profileMenu" class="profile-menu" hidden>
+          <button id="editNameButton" type="button">Edit Name</button>
+          <button id="exportHistoryButton" type="button">Export History</button>
+          <button id="importHistoryButton" type="button">Import History</button>
+          <button id="logoutButton" type="button">Logout</button>
+          <input id="historyImportInput" type="file" accept=".kd,.json,application/json" hidden />
+        </div>
+      </div>
+      <section class="container">
+        <header class="header">
+          <img class="app-icon" src="/icon.png" alt="" />
+          <h1 class="header-title">Karaoke Requests</h1>
+          <p class="header-subtitle">Search the catalog, pick your version, and watch your queue.</p>
+        </header>
+
+        <nav class="page-tabs" aria-label="Request page views">
+          <button id="searchTab" class="page-tab active" type="button" data-page="search">Search</button>
+          <button id="artistTab" class="page-tab" type="button" data-page="artists">Browse Artists</button>
+          <button id="songTab" class="page-tab" type="button" data-page="songs">Browse Songs</button>
+        </nav>
+
+        <input id="singerName" autocomplete="name" hidden />
+
+        <section id="closedPage" class="card closed-page page-panel">
+          <h2 class="section-title">Requests are currently closed</h2>
+          <p class="closed-message">We are not accepting requests at this time.</p>
+        </section>
+
+        <section id="searchPage" class="card page-panel">
+          <label for="searchInput" class="form-label">Search songs</label>
+          <div class="search-wrapper">
+            <input id="searchInput" class="search-input" autocomplete="off" enterkeyhint="search" placeholder="Search local library & Online…" />
+            <button id="clearSearchButton" class="search-clear" type="button" aria-label="Clear search" title="Clear search">×</button>
+          </div>
+          <div class="search-actions">
+            <button id="searchButton" class="primary">Search</button>
+          </div>
+          <div id="message" class="message" role="status"></div>
+          <div id="results" class="results"></div>
+        </section>
+
+        <section id="artistPage" class="card page-panel" hidden>
+          <h2 class="section-title">Browse by Artist</h2>
+          <select id="artistInitials" class="initial-selector browse-letter-select" aria-label="Filter artists"></select>
+          <div id="artistList" class="results"></div>
+          <div id="artistSongsHeader" class="browse-subheader" hidden>
+            <button id="backToArtistsButton" class="secondary compact" type="button">← Artists</button>
+            <h3 id="artistSongsTitle">Artist Songs</h3>
+          </div>
+          <div id="artistSongs" class="results" hidden></div>
+        </section>
+
+        <section id="songPage" class="card page-panel" hidden>
+          <h2 class="section-title">Browse by Song</h2>
+          <select id="songInitials" class="initial-selector browse-letter-select" aria-label="Filter songs"></select>
+          <div id="songResults" class="results"></div>
+        </section>
+
+      </section>
+    </main>
+
+    <button id="queueFooter" class="queue-footer" type="button">
+      <div>
+        <div class="queue-footer-title">📋 My Queue</div>
+        <div id="queueFooterSummary" class="queue-footer-summary">No songs in queue yet — tap to view</div>
+      </div>
+      <span>My Queue ›</span>
+    </button>
+
+    <dialog id="nameDialog" class="app-dialog">
+      <div class="dialog-header">
+        <h2>Who is singing?</h2>
+      </div>
+      <div class="dialog-body">
+        <p class="muted">Enter your first name and at least a last initial so requests and queue edits stay linked to you.</p>
+        <input id="nameDialogInput" class="form-input" autocomplete="name" placeholder="First L or First Last" />
+        <p id="nameDialogError" class="field-error" role="alert"></p>
+        <button id="nameDialogSave" class="primary full-width" type="button">Continue</button>
+      </div>
+    </dialog>
+
+    <dialog id="queueDialog" class="app-dialog">
+      <div class="dialog-header">
+        <h2>My Queue</h2>
+        <div class="dialog-actions">
+          <button id="openHistoryDialog" class="secondary" type="button">History</button>
+          <button id="closeQueueDialog" class="secondary" type="button">Close</button>
+        </div>
+      </div>
+      <div id="queue" class="queue dialog-body"></div>
+    </dialog>
+
+    <dialog id="historyDialog" class="app-dialog">
+      <div class="dialog-header">
+        <h2>History</h2>
+        <button id="closeHistoryDialog" class="secondary" type="button">Close</button>
+      </div>
+      <div id="historyList" class="history-list dialog-body"></div>
+    </dialog>
+
+    <dialog id="versionDialog" class="app-dialog">
+      <div class="dialog-header">
+        <h2 id="versionDialogTitle">Choose a version</h2>
+        <div class="dialog-actions">
+          <button id="versionLyricsButton" class="icon-action-button secondary" type="button" aria-label="View lyrics" title="View lyrics">♪</button>
+          <button id="closeVersionDialog" class="secondary" type="button">Close</button>
+        </div>
+      </div>
+      <div id="versionList" class="version-list"></div>
+    </dialog>
+
+    <dialog id="lyricsDialog" class="app-dialog">
+      <div class="dialog-header">
+        <h2 id="lyricsDialogTitle">Lyrics</h2>
+        <button id="closeLyricsDialog" class="secondary" type="button">Close</button>
+      </div>
+      <pre id="lyricsContent" class="lyrics-content">Loading…</pre>
+    </dialog>
+
+    <dialog id="optionsDialog" class="app-dialog options-dialog">
+      <div class="dialog-header">
+        <h2 id="optionsDialogTitle">Options</h2>
+        <button id="closeOptionsDialog" class="secondary" type="button">Close</button>
+      </div>
+      <div id="optionsDialogBody" class="dialog-body"></div>
+    </dialog>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

@@ -86,6 +86,25 @@ function buildPitchFilterFallback(pitchRatio: number): string {
   return `asetrate=44100*${pitchRatio.toFixed(6)},${atempoFilters.join(',')},aresample=44100`;
 }
 
+function isSupportedExternalVideoUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    return (
+      parsed.protocol === 'https:' &&
+      (
+        host === 'youtu.be' ||
+        host === 'youtube.com' ||
+        host.endsWith('.youtube.com') ||
+        host === 'youtube-nocookie.com' ||
+        host.endsWith('.youtube-nocookie.com')
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 export const mediaRouter = express.Router();
 
 // Handle CORS preflight requests for all media endpoints (Express 5 compatible wildcard)
@@ -187,6 +206,67 @@ mediaRouter.get('/file', (req, res) => {
     res.setHeader('Content-Length', String(stat.size));
     fs.createReadStream(safePath).pipe(res);
   }
+});
+
+mediaRouter.get('/youtube-stream', (req, res) => {
+  const url = String(req.query.url || '').trim();
+  if (!url || !isSupportedExternalVideoUrl(url)) {
+    return res.status(400).send('Invalid YouTube URL');
+  }
+
+  addCorsHeaders(res, req);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Cache-Control', 'no-cache, no-store');
+
+  const args = [
+    '--format',
+    'best[ext=mp4][vcodec!=none][acodec!=none][height<=1080]/best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none][height<=1080]/best[vcodec!=none][acodec!=none]',
+    '--no-playlist',
+    '--no-part',
+    '--quiet',
+    '--no-warnings',
+    '--output',
+    '-',
+    url,
+  ];
+
+  const ytdlp = spawn('yt-dlp', args);
+  let errorOutput = '';
+  let responseStarted = false;
+
+  ytdlp.stdout.once('data', (chunk) => {
+    responseStarted = true;
+    res.write(chunk);
+    ytdlp.stdout.pipe(res);
+  });
+
+  ytdlp.stderr.on('data', (chunk) => {
+    errorOutput += chunk.toString();
+  });
+
+  ytdlp.on('error', (error) => {
+    if (!res.headersSent) {
+      res.status(500).send(error.message);
+    } else {
+      res.destroy(error);
+    }
+  });
+
+  ytdlp.on('close', (code) => {
+    if (code !== 0) {
+      console.error(`[youtube-stream] yt-dlp exited with code ${code}: ${errorOutput.trim()}`);
+      if (!responseStarted && !res.headersSent) {
+        res.status(502).send(errorOutput.trim() || `yt-dlp exited with code ${code}`);
+      }
+    }
+    if (!res.writableEnded) res.end();
+  });
+
+  req.on('close', () => {
+    if (!ytdlp.killed) {
+      try { ytdlp.kill('SIGKILL'); } catch {}
+    }
+  });
 });
 
 mediaRouter.get('/zip', async (req, res) => {

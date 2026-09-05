@@ -13,7 +13,18 @@ export const API_BASE = envBase || inferredBase || devDefault;
 
 export async function api(path: string, init?: RequestInit) {
   const r = await fetch(API_BASE + path, init);
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) {
+    const text = await r.text();
+    let message = text || r.statusText;
+    try {
+      const body = JSON.parse(text);
+      if (typeof body?.error === 'string') message = body.error;
+      else if (typeof body?.message === 'string') message = body.message;
+    } catch {
+      // Keep the plain text response.
+    }
+    throw new Error(message || `HTTP ${r.status}`);
+  }
   return r.json();
 }
 

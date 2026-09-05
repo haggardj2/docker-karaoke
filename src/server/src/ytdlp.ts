@@ -13,6 +13,7 @@ import { logger } from './logger.js';
 // 3. Best available (max 1080p) - fallback for any format
 // The [height<=1080] filter ensures we don't download 4K/8K videos
 const DEFAULT_VIDEO_FORMAT = 'bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best[height<=1080]';
+const DEFAULT_DOWNLOAD_LOCATION = process.env.YTDLP_DOWNLOAD_LOCATION || '/media/downloads';
 
 // Characters that are invalid in filenames across operating systems
 const INVALID_FILENAME_CHARS = /[<>:"/\\|?*]/g;
@@ -201,7 +202,7 @@ export async function downloadVideo(
   try {
     // Get download location from settings
     const downloadLocationSetting = await getSetting('ytdlp.download_location');
-    const downloadLocation = downloadLocationSetting || '/media/downloads';
+    const downloadLocation = downloadLocationSetting || DEFAULT_DOWNLOAD_LOCATION;
     
     // Ensure download directory exists
     await fs.mkdir(downloadLocation, { recursive: true });
@@ -389,7 +390,7 @@ export async function scanDownloadLocation(): Promise<{
       const { query } = await import('./db');
       
       const downloadLocationSetting = await getSetting('ytdlp.download_location');
-      const downloadLocation = downloadLocationSetting || '/media/downloads';
+      const downloadLocation = downloadLocationSetting || DEFAULT_DOWNLOAD_LOCATION;
       
       try {
         await fs.access(downloadLocation);
